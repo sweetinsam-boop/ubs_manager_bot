@@ -1,0 +1,9 @@
+python-telegram-bot>=20.0
+requests
+pandas
+yfinance
+pytz
+python-dotenv
+pandas_market_calendars
+matplotlib
+seaborn
