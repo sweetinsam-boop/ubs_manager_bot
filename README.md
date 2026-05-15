@@ -1,17 +1,103 @@
-# UBS Manager Bot
+# 📈 UBS Manager Trading Bot (무한매수법 자동매매 봇)
 
-UBS Manager Telegram Bot for automated trading (V2.2, V3.0, V4.0).
+이 프로젝트는 라오어(Laoe)님의 **'무한매수법'** 이론을 기반으로, **한국투자증권(KIS) API**를 사용하여 미국 주식(TQQQ, SOXL 등)을 자동으로 매매하고 관리하는 시스템입니다. 텔레그램 봇을 통해 언제 어디서든 투자 현황을 확인하고 제어할 수 있습니다.
 
-## Description
-This bot automates the "Infinite Purchase Method" (무한매수법) trading strategies using the Korea Investment & Securities (KIS) API. It features a Telegram interface for monitoring, manual ordering, and automated scheduling.
+---
 
-## Features
-- **Automated Trading**: Supports V2.2, V3.0, and V4.0 strategies.
-- **Telegram Interface**: Real-time status updates, manual orders, and report generation.
-- **Docker Support**: Easy deployment on Synology NAS or cloud environments.
-- **Persistence**: State management using localized JSON storage.
+## ✨ 주요 특징
 
-## Setup
-1. Clone the repository.
-2. Create a `.env` file with your credentials (see `config_manager.py`).
-3. Run using Docker: `docker-compose up -d`.
+- **다양한 전략 지원**: 
+  - **V2.2 (기초)**: 정석적인 반반 LOC 매수 방식.
+  - **V3.0 (표준)**: T값(누적금액)과 별 지점을 활용한 고점 매수 방지 및 하락장 대응.
+  - **V4.0 (진화)**: 원금 소진 시 '리버스 모드'를 통한 능동적인 평단 관리 및 탈출 전략.
+- **텔레그램 기반 컨트롤**: 
+  - 명령어로 종목 추가/수정/삭제 및 실시간 시세 반영 현황 조회.
+  - 장중 수동 주문 및 즉시 전량 매도(익절) 기능.
+- **지능형 스케줄러**: 
+  - 미국 정규장 오픈 시 자동 주문 전송.
+  - 장 종료 후 자동 잔고 동기화 및 수익 정산 리포트 발송.
+  - 프리마켓 실시간 모니터링을 통한 목표가 도달 시 자동 익절.
+- **안정적인 배포**: 
+  - Docker 및 Docker Compose 지원으로 시놀로지 NAS, 라즈베리 파이 등에서 24시간 안정적으로 구동.
+  - 로컬 JSON 데이터베이스를 사용하여 서버 재시작 시에도 매매 회차 및 기록 유지.
+
+---
+
+## 📈 무한매수법 버전별 가이드
+
+1. **V2.2 (기초)**
+   - 평단가와 시중가로 나누어 LOC 주문을 내는 가장 대중적인 방식입니다. 주가가 평단보다 낮을 때 더 많은 수량을 확보하여 평단을 낮추는 데 집중합니다.
+
+2. **V3.0 (표준)**
+   - 종목별 변동성을 고려하여 '별 지점(★)'을 설정합니다. 주가가 별 지점보다 높을 때는 매수를 쉬어 고점 매수를 방지하고, 하락장에서는 줍줍(거미줄 매수) 기능을 통해 대응합니다.
+
+3. **V4.0 (리버스)**
+   - 설정한 분할 횟수를 모두 채웠음에도 익절에 실패했을 경우, 매일 보유 수량의 10%씩을 매도하고 그 현금으로 다시 낮은 가격에 매수하는 '리버스 모드'를 실행합니다. 하락장이 길어질 때 평단을 획기적으로 낮추는 최신 전략입니다.
+
+---
+
+## 🛠️ 사전 준비 사항
+
+시작하기 전 아래의 정보들을 준비해야 합니다.
+
+1. **한국투자증권 API**: [개발자 센터](https://apiportal.koreainvestment.com/)에서 계좌를 등록하고 **App Key**와 **App Secret**을 발급받으세요. (해외주식 권한 필수)
+2. **텔레그램 봇**: [@BotFather](https://t.me/botfather)와 대화하여 봇을 만들고 **봇 토큰(Token)**을 받으세요.
+3. **서버 환경**: 24시간 가동 가능한 환경(시놀로지 NAS, 클라우드 VPS 등)에 Docker가 설치되어 있어야 합니다.
+
+---
+
+## 🚀 설치 및 실행 방법 (Docker 기준)
+
+### 1. 코드 가져오기
+```bash
+git clone https://github.com/sweetinsam-boop/ubs_manager_bot.git
+cd ubs_manager_bot
+```
+
+### 2. 환경 설정 (.env)
+`.env.example` 파일을 복사하여 `.env` 파일을 만들고 본인의 정보를 입력합니다.
+```bash
+cp .env.example .env
+# 나노(nano)나 다른 에디터로 편집
+nano .env
+```
+```env
+TELEGRAM_TOKEN=123456789:ABCDE...
+APP_KEY=본인의_App_Key
+APP_SECRET=본인의_App_Secret
+CANO=계좌번호_앞8자리
+ACNT_PRDT_CD=01
+```
+
+### 3. 컨테이너 실행
+```bash
+docker-compose up -d
+```
+이제 봇이 백그라운드에서 실행됩니다. 텔레그램에서 본인의 봇에게 `/start`를 보내 확인하세요.
+
+---
+
+## 🎮 주요 명령어 안내
+
+| 명령어 | 기능 설명 |
+| :--- | :--- |
+| `/status` | 현재 보유 종목의 평단, 수익률, 진행 회차, 금일 주문 현황 요약 보고 |
+| `/sync` | 증권사 잔고와 봇의 상태를 강제로 일치시키고 최신 시세 업데이트 |
+| `/report` | 기간별 누적 수익 내역과 실적 차트(이미지) 발송 |
+| `/add_target` | 새 종목 추가 (예: `/add_target TQQQ 2000 40 10 3.0`) |
+| `/edit_target` | 투자 중인 종목의 시드, 분할 횟수, 익절 목표 등 수정 |
+| `/liquidate` | 특정 종목을 즉시 전량 매도하고 해당 사이클을 강제 종료 |
+| `/cash` | 현재 계좌에 남아 있는 달러 예수금 확인 |
+| `/help` | 명령어 상세 가이드 및 무한매수 이론 요약 확인 |
+
+---
+
+## ⚠️ 면책 조항 (Disclaimer)
+
+- **원금 보장 불가**: 본 프로그램은 투자 전략의 자동화를 돕는 도구일 뿐, 수익을 보장하지 않습니다. 모든 투자의 결과는 사용자 본인에게 귀속됩니다.
+- **손실 위험**: 3배 레버리지 ETF(TQQQ, SOXL 등)는 변동성이 매우 크며, 무한매수법 역시 하락장이나 횡보장에서 원금 손실의 위험이 있습니다. 충분한 공부 후에 이용하시기 바랍니다.
+- **기술적 오류**: API 통신 장애, 서버 다운, 소프트웨어 버그 등으로 인해 주문이 실패하거나 원치 않는 주문이 나갈 수 있습니다. 정기적으로 계좌 상태를 직접 확인하시기를 권장합니다.
+
+---
+**Developer**: sweetinsam-boop  
+**Theory based on**: 라오어의 무한매수법 (Laoe's Infinite Purchase Method)
