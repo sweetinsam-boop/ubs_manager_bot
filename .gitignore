@@ -1,0 +1,23 @@
+.env
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local data and logs
+logs/
+storage/
+tmp/
+scratch/
+*.dat
+*.json
+!requirements.txt
+
+# Reference documents and PDFs (excluded as per user request)
+*.pdf
+*.xlsx
+*.md
+!README.md
+*.txt
+*.png

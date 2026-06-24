@@ -1,0 +1,13 @@
+# 무한매수 봇: 프로젝트 루트(.)를 /app 에 마운트.
+# 설정/데이터(UBS_config.json, trading_settings.json, token.dat, trade_lock.json 등)는
+# storage.paths 기준으로 /app 하위에 읽기/쓰기되므로 호스트 디렉터리에 유지됩니다.
+version: '3'
+services:
+  telegram-bot:
+    build: .
+    container_name: my_telegram_bot
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: python main.py
+    restart: unless-stopped

@@ -1,398 +1,802 @@
+"""
+텔레그램 봇: 커맨드/콜백 핸들러 및 메뉴.
+콜백 액션은 CALLBACK_HANDLERS 매핑으로 디스패치합니다.
+"""
 from __future__ import annotations
 
 import asyncio
-import logging
+import math
+import os
+import io
 import traceback
-from typing import Any
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    BotCommand,
-)
+import datetime
+import pytz
+from dateutil import parser
+import pandas as pd
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand
+from telegram.constants import MessageEntityType
 from telegram.ext import ContextTypes
 
 import kis_client
 import strategy
 import utils
+import state_manager
+import guide_theory
 from state_manager import STRATEGY, CURRENT_CASH
-from trade_service import TradeService
+from bot_logging import get_logger, read_recent_log_text
 from notification_service import notifier
 from ui_formatter import UIFormatter
-import guide_theory
+from trade_service import TradeService
 
-log = logging.getLogger(__name__)
-
-# --- 공통 헬퍼 ---
-
-def main_reply_keyboard_markup():
-    """하단 고정 버튼 메뉴"""
-    keyboard = [
-        [KeyboardButton("📊 현황보기"), KeyboardButton("💰 예수금확인")],
-        [KeyboardButton("신규동기화"), KeyboardButton("🧾 수동주문")],
-        [KeyboardButton("📈 수익보고"), KeyboardButton("📋 수익기록")],
-        [KeyboardButton("🕔 프리마켓 ON"), KeyboardButton("🔕 프리마켓 OFF")],
-        [KeyboardButton("📚 도움말")],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+log = get_logger(__name__)
 
 
-def _runtime_strategy_entry(ticker, s_val) -> dict:
-    """state_manager의 STRATEGY 딕셔너리에 들어갈 런타임 구조체 생성"""
-    from state_manager import normalize_strategy_method, _parse_one_time_usd
-    return {
-        "seed": float(s_val.get("seed", 0.0)),
-        "total_a": float(s_val.get("total_a", 20.0)),
-        "target_profit": float(s_val.get("target_profit", 10.0)),
-        "method": normalize_strategy_method(s_val.get("method")),
-        "one_time_usd": _parse_one_time_usd(s_val.get("one_time_usd")),
-        "data": {"avg": 0.0, "qty": 0.0, "cumul": 0.0},
-    }
-
-def _v30_v40_hardcoded_profit(ticker: str) -> float | None:
-    """TQQQ/SOXL 종목에 대해 V3.0/V4.0일 때 하드코딩된 목표수익률을 반환합니다."""
-    t = str(ticker or "").strip().upper()
-    if t == "TQQQ": return 10.0
-    if t == "SOXL": return 12.0
+def _v30_v40_hardcoded_profit(ticker: str):
+    """V3.0/V4.0 하드코딩 수익률: TQQQ=15%, SOXL=20%, 그 외=None(사용자 입력 필요)."""
+    t = ticker.upper()
+    if t == "TQQQ":
+        return 15.0
+    if t == "SOXL":
+        return 20.0
     return None
 
+
+def _runtime_strategy_entry(ticker: str, sv: dict, data=None) -> dict:
+    """trading_settings 종목 dict → STRATEGY 런타임 엔트리 (method·one_time_usd 유지 규칙 동일)."""
+    ot = sv.get("one_time_usd")
+    try:
+        one_time_usd = float(ot) if ot is not None and str(ot).strip() != "" else None
+    except (TypeError, ValueError):
+        one_time_usd = None
+    if data is None:
+        data = STRATEGY.get(ticker, {}).get("data", {"avg": 0.0, "qty": 0.0, "cumul": 0.0})
+    return {
+        "seed": float(sv["seed"]),
+        "total_a": float(sv["total_a"]),
+        "target_profit": float(sv["target_profit"]),
+        "method": state_manager.normalize_strategy_method(sv.get("method")),
+        "one_time_usd": one_time_usd,
+        "data": data,
+    }
+
+
+# 매뉴얼 가이드 타입별 설명 (guide 콜백용)
+GUIDE_TEXTS = {
+    "status": (
+        "🔍 **Status(현황보기) 딥다이브**\n\n"
+        "• **입력 유입**: KIS 실시간 API를 통해 종목별 평단가, 보유 수량, 현재 가격을 수집합니다.\n"
+        "• **내부 계산**: 사용자가 설정한 분할 횟수와 현재 평단을 대조하여 '별 포인트'와 '탈출 포인트'를 연산합니다.\n"
+        "• **교차 검증**: 이론값만 보여주는 것이 아니라, 증권사 서버의 '미체결 주문 리포트'를 직접 읽어와 실제 주문이 들어갔는지 0.1초 단위로 비교합니다.\n"
+        "• **결과물**: [현재 수익률], [이론상 매수/매도 계획], [실제 증권사 대기 주문]을 하나로 합친 통합 리포트를 제공합니다."
+    ),
+    "cash": (
+        "💰 **Cash & Report 딥다이브**\n\n"
+        "• **입력 유입**: 계좌 내 외화/원화 현고와 한국투자증권 고시 환율 정보를 가져옵니다.\n"
+        "• **내부 계산**: 환율을 적용하여 전체 자산을 '달러($)' 기준으로 통합 환산하고, `cumul_profit.json` 파일에 저장된 과거 익절 기록을 합산합니다.\n"
+        "• **결과물**: 실시간 가용 자산 현황과 지금까지 누적된 확정 수익금을 원화와 달러로 동시에 리포트합니다."
+    ),
+    "sync": (
+        "🔄 **Sync(계좌 동기화) 딥다이브**\n\n"
+        "• **입력 유입**: `trading_settings.json` 설정값과 증권사 잔고 데이터를 다시 읽어옵니다.\n"
+        "• **내부 계산**: 보유수량/평단/예수금을 최신화하고, 오늘의 매매 계획 계산이 정확해지도록 상태를 갱신합니다.\n"
+        "• **결과물**: 동기화 완료 메시지만 반환합니다. 주문 전송은 `/manual_order` 또는 자동 스케줄에 의해 수행됩니다."
+    ),
+    "manual_order": (
+        "🧾 **Manual Order(수동 주문) 딥다이브**\n\n"
+        "• **1단계**: 먼저 `/sync`와 동일하게 계좌 동기화를 수행합니다.\n"
+        "• **2단계**: 증권사 서버의 미체결 주문을 조회해 '이미 주문이 있는지'를 종목별로 보여줍니다.\n"
+        "• **3단계**: 사용자가 종목을 선택하면, 무한매수 방법론에 따른 '오늘의 LOC 주문'을 전송합니다.\n"
+        "• **주의**: 이미 오늘 주문을 넣은 종목에 추가 주문을 넣으면 과매수/중복 주문이 될 수 있어, 실행 전 현황을 반드시 확인해야 합니다."
+    ),
+    "setup": (
+        "📝 **Add & Edit(설정관리) 딥다이브**\n\n"
+        "• **입력 유입**: 사용자의 텍스트 명령어(티커, 시드, 횟수 등)를 파싱합니다.\n"
+        "• **내부 계산**: 입력받은 '전체 시드'를 '분할 횟수'로 나누어 1회 기본 매수금을 정하고, 목표 수익률에 따른 하락장 대응 로직(LIFO 매도 등)을 설정 파일에 반영합니다.\n"
+        "• **결과물**: 봇의 감시 목록에 해당 종목이 추가되며, 즉시 첫 번째 동기화 작업을 수행하여 감시 사이클을 가동합니다."
+    ),
+    "sell": (
+        "🚨 **Liquidate & 사이클 종료 딥다이브**\n\n"
+        "• **입력 유입**: 긴급 전량 매도 신호 또는 목표가 도달 신호를 받습니다.\n"
+        "• **내부 계산**: 일반적인 지정가가 아닌 'MOC(Market on Close - 장마감 시장가)' 주문을 활용하여 반드시 오늘 내로 체결되도록 신뢰도를 높입니다.\n"
+        "• **결과물**: 모든 물량이 청산되면 투자 사이클이 종료되었음을 알리고, 해당 기간의 S&P 500 상승분과 내 수익을 정밀 비교하는 '종합 성적표'를 발송합니다."
+    ),
+    "theory_22": guide_theory.THEORY_22,
+    "theory_30": guide_theory.THEORY_30,
+    "theory_40": guide_theory.THEORY_40,
+    "theory_compare": guide_theory.THEORY_COMPARE,
+}
+
+
 def _message_has_bot_command(message) -> bool:
-    """메시지에 봇 커맨드 엔티티가 포함되어 있는지 확인합니다."""
-    if not message or not message.entities:
+    if not message or not getattr(message, "text", None):
         return False
-    return any(e.type == "bot_command" for e in message.entities)
+    for ent in message.entities or ():
+        if ent.type == MessageEntityType.BOT_COMMAND:
+            return True
+    return False
 
 
-# --- 명령어 핸들러 ---
+def _build_cmd_cash_message():
+    """KIS 예수금·보유 조회(동기). 성공 시 (msg, None), 실패 시 (None, err_str)."""
+    try:
+        token = kis_client.get_kis_access_token()
+        usd_cash, cash_source = kis_client.query_available_cash(token)
+        data = kis_client.query_account_raw() or {}
+        rt_cd = data.get("rt_cd", "N/A")
+
+        msg = f"[예수금 조회]\n"
+        msg += f"달러 예수금: ${usd_cash:,.2f}\n"
+
+        krw_cash = kis_client.query_krw_cash(token)
+        msg += f"원화 예수금: ₩{int(krw_cash):,}원\n"
+
+        rate, ref_time_raw = kis_client.get_exchange_rate()
+
+        try:
+            dt_obj = parser.parse(ref_time_raw)
+            kst_str = dt_obj.strftime("%m-%d %H:%M")
+            ny_tz = pytz.timezone("America/New_York")
+            ny_str = dt_obj.astimezone(ny_tz).strftime("%m-%d %H:%M")
+            ref_time_display = f"{kst_str} KST / {ny_str} NY"
+        except Exception:
+            ref_time_display = ref_time_raw
+
+        msg += f"--------------------------\n"
+        msg += f"실시간 환율: {rate:,.2f}원 ({ref_time_display})\n"
+
+        holdings = data.get("output1", []) if rt_cd == "0" else []
+        all_stock_evl = 0.0
+        if holdings:
+            msg += "\n[보유 종목]\n"
+            for item in holdings:
+                sym = item.get("ovrs_pdno", "?").strip()
+                qty_str = item.get("ovrs_cblc_qty", "0")
+                avg = item.get("pchs_avg_pric", "0")
+                qty_f = float(qty_str)
+                avg_f = float(avg)
+                now_f = kis_client.get_current_price(sym)
+                pnl = now_f * qty_f - avg_f * qty_f
+                pnl_rt = ((now_f - avg_f) / avg_f * 100) if avg_f > 0 else 0.0
+                all_stock_evl += now_f * qty_f
+                in_strategy = " *" if sym in STRATEGY else ""
+                msg += f"  {sym}{in_strategy}: {qty_str}주 / 현재${now_f:,.2f} / 손익${pnl:,.2f}({pnl_rt:.1f}%)\n"
+
+        msg += f"\n현금: ${usd_cash:,.2f} / 주식: ${all_stock_evl:,.2f}\n"
+        return msg, None
+    except Exception as e:
+        return None, str(e)
+
+
+def _build_manual_order_summary_text():
+    summary = "[수동 주문] 현재 주문/잠금 현황 (미국 동부 당일 미체만)\n"
+    summary += "--------------------------\n"
+    locked_tickers = []
+    for ticker in STRATEGY:
+        locked = utils.check_trade_lock(ticker)
+        if locked:
+            locked_tickers.append(ticker)
+        unfilled = []
+        try:
+            unfilled = kis_client.query_unfilled_orders_today_us(ticker)
+        except Exception:
+            unfilled = []
+        try:
+            locked_by_broker = bool(unfilled)
+        except Exception:
+            locked_by_broker = False
+        if locked_by_broker and not locked:
+            locked = True
+            locked_tickers.append(ticker)
+            try:
+                utils.set_trade_lock(ticker)
+            except Exception:
+                pass
+        lock_tag = "LOCKED" if locked else "OPEN"
+        if unfilled:
+            active_cnt = sum(1 for u in unfilled if u.get("status") == "대기")
+            summary += f"• {ticker} [{lock_tag}]: 당일 미체결 {len(unfilled)}건 (대기 {active_cnt}건)\n"
+        else:
+            summary += f"• {ticker} [{lock_tag}]: 당일 미체결 없음\n"
+
+    if locked_tickers:
+        summary += "\n오늘 주문 전송됨(LOCKED) 종목: " + ", ".join(sorted(set(locked_tickers))) + "\n"
+        summary += "  └ (수동 주문은 가능하지만, 중복/과매수 위험이 있어 주의가 필요합니다.)\n"
+
+    summary += "\n주의(추가매수/추가주문)\n"
+    summary += "- 이미 오늘 주문을 전송한 종목에 대해 추가로 주문을 넣으면, 전략 의도와 다르게 과매수/중복 주문이 될 수 있습니다.\n"
+    summary += "- 반드시 /status에서 최근 주문·체결 내역을 확인한 뒤 진행하세요.\n"
+    return summary
+
+
+def main_reply_keyboard_markup() -> ReplyKeyboardMarkup:
+    """상설 메뉴 키보드 (/start·알 수 없는 입력 안내 등에서 공통 사용)."""
+    rows = [
+        ["📊 현황보기(/status)", "💰 예수금확인(/cash)"],
+        ["📈 수익보고(/report)"],
+        ["신규동기화(/sync)", "🧾 수동주문(/manual_order)"],
+        ["📚 도움말(/help)", "📋 수익기록(/profit_history)"],
+        ["🕔 프리마켓 ON", "🔕 프리마켓 OFF"],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    chat_id = update.message.chat_id
     utils.save_chat_id(chat_id)
     
+    from scheduler import register_schedules
+    register_schedules(context.job_queue, chat_id)
+    
+    markup = main_reply_keyboard_markup()
+    
     welcome_msg = (
-        "👋 **안녕하세요! UBS Manager Trading Bot입니다.**\n\n"
-        "이 봇은 무한매수법(V2.2, V3.0, V4.0)을 기반으로 한 자동 매매 및 모니터링 시스템입니다.\n\n"
-        "**주요 명령어:**\n"
-        "/status - 현재 종목별 투자 현황 및 매매 지시서 확인\n"
-        "/sync - 증권사 잔고와 실시간 동기화\n"
-        "/report - 기간별 수익 및 성과 리포트\n"
-        "/help - 전체 명령어 가이드\n\n"
-        "아래 메뉴 버튼을 사용하여 간편하게 조작하실 수 있습니다."
+        "🚀 **무한매수봇 2.0 - 당신의 개인 투자 비서**\n\n"
+        "봇이 정상적으로 가동되었습니다! 설정하신 전략에 따라 매일 밤 자동으로 매매를 수행합니다.\n\n"
+        "⏰ **핵심 자동화 스케줄 (한국 시간 기준)**\n"
+        "• **17:00 / 18:00**: 프리마켓 감시 시작 (설정 시)\n"
+        "• **22:35 / 23:35**: 정규장 오픈 및 일일 주문 전송\n"
+        "• **05:00 / 06:00**: 정규장 마감 알림\n"
+        "• **장 마감 후(미국 동부, `trading_settings.json`의 `POST_CLOSE_SYNC_NY`, 기본 16:40)**: 계좌 자동 동기화(`/sync`와 동일)\n"
+        "• **08:00 (화~토, KST)**: 종합 정산 리포트 및 수익 보고 (일·월 아침은 생략)\n\n"
+        "💡 아래 메뉴 버튼을 누르면 타이핑 없이 주요 기능을 즉시 실행할 수 있습니다. 자세한 사용법은 `/help`를 확인해주세요!\n"
+        "🛠 오류·스케줄 이상 시 서버 기록은 `/logs` (최근 24시간)로 확인할 수 있습니다."
     )
-    await update.message.reply_text(
-        UIFormatter.clean_text(welcome_msg), 
-        reply_markup=main_reply_keyboard_markup()
-    )
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """현재 투자 현황 및 지시서 요약"""
-    # 1. 최신 시세 및 잔고 동기화 (선택적: 너무 잦으면 생략 가능하지만 상태 정확성을 위해 권장)
-    import state_manager
-    sync_ok, sync_msg = await asyncio.to_thread(state_manager.sync_account)
-    if not sync_ok:
-        log.warning("cmd_status 동기화 실패: %s", sync_msg)
-    
-    # 2. 리포트 데이터 구성
-    report_data = TradeService.prepare_daily_report_data()
-    summary_text = UIFormatter.format_daily_report(report_data)
-    
-    # 3. 상세 지시서 확인용 인라인 버튼 구성
-    keyboard = []
-    for tkr in sorted(STRATEGY.keys()):
-        keyboard.append([InlineKeyboardButton(f"🔍 {tkr} 상세 지시서", callback_data=f"status_dive:{tkr}")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-    await update.message.reply_text(
-        UIFormatter.clean_text(summary_text),
-        reply_markup=reply_markup
-    )
-
-
-async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """수동 잔고 동기화"""
-    msg = await update.message.reply_text("🔄 증권사 계좌 정보를 가져오는 중입니다...")
-    
-    import state_manager
-    success, res_msg = await asyncio.to_thread(state_manager.sync_account)
-    
-    sync_done = f"✅ **동기화 완료**\n\n{res_msg}" if success else f"❌ **동기화 실패**\n\n{res_msg}"
-    await msg.edit_text(UIFormatter.clean_text(sync_done))
-
-
-async def cmd_cash(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """예수금 정보 확인"""
-    import state_manager
-    # 동기화 먼저 수행
-    await asyncio.to_thread(state_manager.sync_account)
-    
-    msg = f"💰 **현재 보유 달러 예수금**\n\n=> ${CURRENT_CASH:,.2f}"
-    await update.message.reply_text(UIFormatter.clean_text(msg))
-
-
-async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """수익 보고서 및 성과 차트"""
-    msg = await update.message.reply_text("📊 성과 데이터를 분석하고 차트를 생성 중입니다...")
-    
-    # 1. 텍스트 리포트 생성
-    report_text = await asyncio.to_thread(TradeService.generate_settlement_report)
-    
-    # 2. 차트 생성
-    from visualization_service import generate_asset_chart
-    chart_path = "tmp/performance_chart.png"
-    success, result = await asyncio.to_thread(generate_asset_chart, chart_path)
-    
-    if success:
-        with open(chart_path, 'rb') as f:
-            await update.message.reply_photo(photo=f, caption=UIFormatter.clean_text(report_text))
-        await msg.delete()
-    else:
-        log.warning("차트 생성 실패: %s", result)
-        await msg.edit_text(UIFormatter.clean_text(report_text + f"\n\n(차트 생성 실패: {result})"))
-
-
-async def cmd_manual_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """수동 주문 인터페이스 (종목 선택)"""
-    if not STRATEGY:
-        await update.message.reply_text("❌ 등록된 투자 종목이 없습니다. /add_target 명령어로 종목을 추가하세요.")
-        return
-
-    keyboard = []
-    for tkr in sorted(STRATEGY.keys()):
-        keyboard.append([InlineKeyboardButton(f"🏦 {tkr} 매매 주문 전송", callback_data=f"unfilled:{tkr}")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    msg = (
-        "🧾 **수동 주문 메뉴**\n\n"
-        "주문을 전송할 종목을 선택하세요.\n"
-        "선택 시 미체결 내역을 먼저 확인한 후 주문 페이지로 이동합니다."
-    )
-    await update.message.reply_text(UIFormatter.clean_text(msg), reply_markup=reply_markup)
-
+    await update.message.reply_text(welcome_msg, reply_markup=markup)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """명령어 가이드 및 이론 설명"""
+    # Telegram Markdown은 '_' 등에서 엔티티 파싱 오류가 잦아 help는 HTML로 고정합니다.
     help_text = (
-        "📚 **UBS Manager Bot 명령어 가이드**\n\n"
-        "**기본 명령어**\n"
-        "/status - 현재 투자 현황 요약\n"
-        "/sync - 잔고 동기화\n"
-        "/report - 성과 보고 및 차트\n"
-        "/cash - 예수금 확인\n"
-        "/logs - 최근 로그 확인\n\n"
-        "**설정 및 관리**\n"
-        "/add_target - 종목 추가\n"
-        "/edit_target - 종목 설정 수정\n"
-        "/del_target - 종목 삭제 (감시 중단)\n"
-        "/liquidate - 전량 익절 매도 및 사이클 종료\n"
-        "/profit_history - 전체 수익 기록 요약\n"
-        "/profit_reset - 수익 기록 초기화\n\n"
-        "**기능 제어**\n"
-        "/pre_on - 프리마켓 감시 활성화\n"
-        "/pre_off - 프리마켓 감시 비활성화\n"
+        "📚 <b>[무한매수봇 도움말]</b>\n\n"
+        "<b>핵심 흐름</b>\n"
+        "- <b>자동 운용</b>: 매일 정규장 오픈 시점에 전략에 따른 주문(LOC 중심)을 자동 전송하고, 다음날 아침 리포트로 체결을 요약합니다.\n"
+        "- <b>동기화</b>(<code>/sync</code>): 내 계좌의 <b>잔고/평단/현금</b>을 봇 상태와 맞춥니다. (입금/설정변경 후 권장)\n"
+        "- <b>수동주문</b>(<code>/manual_order</code>): 먼저 <b>이미 들어간 주문/미체결 여부</b>를 보여준 뒤, 종목을 선택해 <b>오늘의 LOC 주문</b>을 넣습니다.\n\n"
+        "<b>투자 사이클 예시</b>\n"
+        "- Day 1: <code>/add_target</code>로 종목 추가 → 자동/수동주문으로 첫 진입\n"
+        "- Day N: 하락 시 분할 매수로 평단 조정 (전략 파라미터 기반)\n"
+        "- Day M: 목표 수익률 도달 시 전량 익절 매도 → 사이클 종료 보고\n\n"
+        "<b>명령어</b>\n"
+        "- <b>조회</b>: <code>/status</code>(현황+최근 주문·체결), <code>/cash</code>(예수금/보유), <code>/report</code>(누적 수익), <code>/profit_history</code>(익절 기록), <code>/logs</code>(최근 24시간 서버 로그)\n"
+        "- <b>제어</b>: <code>/sync</code>(계좌 동기화), <code>/manual_order</code>(수동 주문), <code>/pre_on</code>(프리마켓 감시 ON), <code>/pre_off</code>(OFF)\n"
+        "- <b>설정</b>: <code>/add_target</code>(추가), <code>/edit_target</code>(수정), <code>/del_target</code>(삭제)\n"
+        "- <b>긴급</b>: <code>/liquidate</code>(전량 매도 및 종료)\n\n"
+        "<b>무한매수법 3.0</b>\n"
+        "- <code>/add_target 티커 시드 분할 목표% 3.0</code> 처럼 마지막에 <code>3.0</code>을 주면 해당 종목만 V3.0 규칙(별%/쿼터, LOC 매도=별%가 등)을 씁니다. 생략 시 2.2.\n"
+        "- 1회 매수금을 시드÷분할이 아니라 고정 달러로 쓰려면 <code>trading_settings.json</code>의 해당 종목에 <code>one_time_usd</code>를 넣으세요.\n"
+        "- <b>V3.0 T·회차</b>: 실매수 누적 USD(<code>v3_buy_state.json</code>)÷1회 기준입니다. <b>2.2</b>는 잔고(평단×수량)÷1회 근사입니다.\n\n"
+        "<b>무한매수법 4.0</b>\n"
+        "- 마지막 인자에 <code>4.0</code>: 일반모드(잔금÷(N-T) 1회매수, 별지점 매수-0.01/매도, 쿼터·매수·리버스 T 갱신은 <b>체결 누적</b> 기준) 및 소진 후 리버스(첫날 MOC 분할, 이후 5일종가 별지점).\n"
+        "- T는 <code>v4_strategy_state.json</code>에 저장됩니다(최초는 잔고 기반 추정). MOC 등 장 마감 체결은 pending 후 <code>/sync</code>에서 재확인합니다.\n\n"
+        "💡 아래 버튼에서 기능 원리·<b>버전별 이론(상세)</b>·<b>버전 비교·시장별 성향</b>을 볼 수 있습니다."
     )
-    
+
     keyboard = [
-        [InlineKeyboardButton("📘 V2.2 이론", callback_data="guide:theory_22"), InlineKeyboardButton("📗 V3.0 이론", callback_data="guide:theory_30")],
-        [InlineKeyboardButton("📙 V4.0 이론", callback_data="guide:theory_40"), InlineKeyboardButton("📊 버전별 비교", callback_data="guide:theory_compare")],
-        [InlineKeyboardButton("📜 전체 수익 상세 기록", callback_data="profit_dive")],
+        [InlineKeyboardButton("📊 Status 원리", callback_data="guide:status"),
+         InlineKeyboardButton("💰 Cash/Report 원리", callback_data="guide:cash")],
+        [InlineKeyboardButton("🔄 Sync 원리", callback_data="guide:sync"),
+         InlineKeyboardButton("🧾 Manual Order 원리", callback_data="guide:manual_order")],
+        [InlineKeyboardButton("📝 설정/추가 원리", callback_data="guide:setup"),
+         InlineKeyboardButton("🚨 특별매도 원리", callback_data="guide:sell")],
+        [
+            InlineKeyboardButton("이론V2.2", callback_data="guide:theory_22"),
+            InlineKeyboardButton("이론V3.0", callback_data="guide:theory_30"),
+            InlineKeyboardButton("이론V4.0", callback_data="guide:theory_40"),
+        ],
+        [InlineKeyboardButton("버전 비교·시장별 유리", callback_data="guide:theory_compare")],
     ]
-    
-    await update.message.reply_text(
-        UIFormatter.clean_text(help_text), 
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text(help_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """최근 로그 조회"""
-    from bot_logging import read_recent_log_text
-    log_text, truncated = read_recent_log_text(hours=24, max_total_chars=3500)
-    
-    title = "📋 **최근 24시간 시스템 로그**"
-    if truncated: title += " (일부 생략됨)"
-    
-    await update.message.reply_text(f"{title}\n\n<pre>{log_text}</pre>", parse_mode="HTML")
-
-
-async def cmd_add_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """종목 추가 (가이드 메시지)"""
-    msg = (
-        "➕ **종목 추가 안내**\n\n"
-        "종목 추가는 한 줄 명령어로 가능합니다.\n"
-        "`/add_target [티커] [시드] [분할] [익절%] [버전(2.2/3.0/4.0)]`\n\n"
-        "**예시:**\n"
-        "`/add_target TQQQ 2000 40 10 3.0`\n"
-        "-> TQQQ를 시드 $2000, 40분할, 10% 익절, V3.0으로 추가\n\n"
-        "💡 V3.0/V4.0의 TQQQ(10%), SOXL(12%)은 익절%를 입력해도 자동 설정값이 우선 적용됩니다."
-    )
-    
-    if not context.args or len(context.args) < 5:
-        await update.message.reply_text(UIFormatter.clean_text(msg))
+    """등록 채팅 전용. 최근 24시간(KST) 로그 — 서버에는 30일 롤링 저장."""
+    cid = utils.load_chat_id()
+    if not cid:
+        await update.message.reply_text("먼저 /start 로 이 채팅을 등록한 뒤 /logs 를 사용할 수 있습니다.")
+        return
+    if update.effective_chat.id != cid:
+        await update.message.reply_text("이 명령은 봇에 등록된 채팅에서만 사용할 수 있습니다.")
         return
 
-    try:
-        ticker = context.args[0].upper()
-        seed = float(context.args[1])
-        total_a = int(context.args[2])
-        profit = float(context.args[3])
-        method = context.args[4]
-        
-        # V3.0/V4.0 하드코딩 체크
-        if method in ("3.0", "4.0"):
-            hard_p = _v30_v40_hardcoded_profit(ticker)
-            if hard_p is not None: profit = hard_p
+    await update.message.reply_text("최근 24시간 로그를 불러오는 중…")
+    preview, prev_trunc = read_recent_log_text(hours=24, max_total_chars=3500)
+    full, full_trunc = read_recent_log_text(hours=24, max_total_chars=400_000)
 
-        from config_manager import STRATEGY_SETTINGS, save_config
-        if ticker in STRATEGY_SETTINGS:
-            await update.message.reply_text(f"❌ {ticker}는 이미 등록된 종목입니다. 수정은 /edit_target을 사용하세요.")
-            return
+    head = (
+        "최근 24시간 로그 (KST)\n"
+        "서버: logs/bot.log · 자정마다 회전 · 최대 30일 보관\n"
+        + "━" * 22
+        + "\n\n"
+    )
+    text = head + preview
+    if prev_trunc:
+        text += "\n\n(미리보기는 뒷부분 위주입니다. 파일에 전체가 담깁니다.)"
+    await update.message.reply_text(text)
 
-        new_settings = dict(STRATEGY_SETTINGS)
-        s_val = {"seed": seed, "total_a": total_a, "target_profit": profit, "method": method}
-        new_settings[ticker] = s_val
+    if len(full) > 3200 or prev_trunc or full_trunc:
+        bio = io.BytesIO(full.encode("utf-8"))
+        bio.name = "ubs_bot_log_24h.txt"
+        cap = "최근 24시간 로그 전문"
+        if full_trunc:
+            cap += " (40만자 초과분 제외)"
+        await update.message.reply_document(document=bio, caption=cap)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("실시간 시세 및 실제 주문 내역을 조회 중입니다...")
+    
+    from scheduler import generate_combined_report
+    msg = await generate_combined_report(is_full=False)
+    
+    keyboard = []
+    for ticker in STRATEGY:
+        keyboard.append([InlineKeyboardButton(f"[상세 지시서] {ticker}", callback_data=f"status_dive:{ticker}")])
         
-        if save_config({"STRATEGY_SETTINGS": new_settings}):
-            STRATEGY[ticker] = _runtime_strategy_entry(ticker, s_val)
-            await update.message.reply_text(f"✅ {ticker}가 성공적으로 추가되었습니다! (/sync 명령어로 잔고를 동기화하세요)")
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def cmd_cash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text("주문가능금액 조회 중...")
+    msg, err = await asyncio.to_thread(_build_cmd_cash_message)
+    if err:
+        await update.message.reply_text(f"조회 오류: {err}")
+        return
+    await update.message.reply_text(msg)
+
+async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg_wait = await update.message.reply_text("계좌 정보를 최신화하는 중입니다... (잔고, 평단가, 예수금을 동기화합니다.)")
+    pre_avgs = await asyncio.to_thread(TradeService.capture_pre_sync_avgs)
+    success, res_msg = await asyncio.to_thread(state_manager.sync_account)
+    if not success:
+        await msg_wait.edit_text(f"[동기화 실패] {res_msg}")
+        return
+
+    sync_done = (
+        "[동기화 완료] 모든 종목의 최신 정보가 반영되었습니다.\n\n"
+        "오늘의 LOC 주문을 수동으로 넣으려면 /manual_order를 실행해 주세요.\n"
+        "(먼저 현재 주문/미체결을 보여주고, 그 다음 종목 선택 -> 주문 전송 순서로 진행합니다.)"
+    )
+    await msg_wait.edit_text(sync_done)
+
+    if pre_avgs:
+        try:
+            profit_msgs = await asyncio.to_thread(
+                TradeService.reconcile_daily_sell_profits, pre_avgs
+            )
+            if profit_msgs:
+                await update.message.reply_text(
+                    "[동기화·매도실현 보정]\n\n" + "\n".join(profit_msgs)
+                )
+        except Exception as e:
+            log.warning("cmd_sync reconcile failed: %s", e, exc_info=True)
+
+
+async def cmd_manual_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    수동 주문 플로우:
+    1) 동기화(잔고/평단/현금) 수행
+    2) 현재 미체결 주문 및 잠금 상태를 보여줌
+    3) 사용자가 종목을 선택하면 무한매수 방법론에 따른 '오늘의 LOC 주문' 전송
+       - (주의) 기존에는 reset으로 잠금을 해제했으나, 이제는 manual_order에서 안내 후 수동 주문을 허용합니다.
+    """
+    msg_wait = await update.message.reply_text(
+        "수동 주문 준비 중...\n(1/2) 계좌 동기화 및 주문 상태를 확인합니다.",
+    )
+    success, res_msg = await asyncio.to_thread(state_manager.sync_account)
+    if not success:
+        await msg_wait.edit_text(f"[동기화 실패] {res_msg}")
+        return
+
+    summary = await asyncio.to_thread(_build_manual_order_summary_text)
+    await msg_wait.edit_text(summary)
+
+    # 2) 종목 선택 버튼 (기존 콜백 주문 로직 재사용)
+    all_infos = {}
+    for ticker in STRATEGY:
+        all_infos[ticker] = strategy.build_order_info(ticker)
+
+    keyboard = []
+    for ticker, info in all_infos.items():
+        # (선택 전 검증 강화) 미체결 상세 보기 버튼 제공
+        keyboard.append(
+            [
+                InlineKeyboardButton(f"🔎 {ticker} 미체결 상세", callback_data=f"m_unfilled:{ticker}"),
+            ]
+        )
+        if info["qty_total"] == 0:
+            if info.get("b1", 0) > 0:
+                cb = f"m_entryask:{ticker}"
+                keyboard.append([InlineKeyboardButton(
+                    f"🚀 {ticker} 새 사이클 LOC 진입 ({info['b1']}주 @ ${info['avg_price']:.2f})",
+                    callback_data=cb,
+                )])
+            else:
+                try:
+                    _excg = kis_client.get_price_exchange_code(ticker)
+                except Exception:
+                    _excg = "?"
+                keyboard.append([InlineKeyboardButton(
+                    f"⚠️ {ticker} 시세조회 실패 (EXCD={_excg}) - 진입 불가", callback_data="noop"
+                )])
         else:
-            await update.message.reply_text("❌ 설정 저장 중 오류가 발생했습니다.")
-            
-    except Exception as e:
-        await update.message.reply_text(f"❌ 형식 오류: {str(e)}\n\n{msg}")
+            keyboard.append(
+                [InlineKeyboardButton(f"🏦 {ticker} 오늘 LOC 매매 주문", callback_data=f"m_all:{ticker}")]
+            )
 
-
-async def cmd_edit_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """종목 설정 수정 (인라인 버튼으로 티커 선택)"""
-    if not STRATEGY:
-        await update.message.reply_text("❌ 수정할 종목이 없습니다.")
-        return
-
-    keyboard = []
-    for tkr in sorted(STRATEGY.keys()):
-        keyboard.append([InlineKeyboardButton(f"📝 {tkr} 설정 수정", callback_data=f"edit_pick:{tkr}")])
-    
     await update.message.reply_text(
-        "📝 **수정할 종목을 선택하세요**", 
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "(2/2) 먼저 미체결 상세를 확인한 뒤, 주문할 종목을 선택하세요.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-async def cmd_del_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """종목 삭제 (인라인 버튼으로 확인)"""
-    if not STRATEGY:
-        await update.message.reply_text("❌ 삭제할 종목이 없습니다.")
-        return
-
-    keyboard = []
-    for tkr in sorted(STRATEGY.keys()):
-        keyboard.append([InlineKeyboardButton(f"🗑️ {tkr} 삭제", callback_data=f"ask_del:{tkr}")])
-    
-    await update.message.reply_text(
-        "🗑️ **삭제할 종목을 선택하세요**\n(감시 대상에서만 제외되며 실제 주식은 팔지 않습니다)", 
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def cmd_liquidate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """전량 이익 매도 및 종료"""
-    if not STRATEGY:
-        await update.message.reply_text("❌ 매도할 종목이 없습니다.")
-        return
-
-    keyboard = []
-    for tkr in sorted(STRATEGY.keys()):
-        if STRATEGY[tkr]["data"]["qty"] > 0:
-            keyboard.append([InlineKeyboardButton(f"🚨 {tkr} 전량매도 및 종료", callback_data=f"ask_liq:{tkr}")])
-    
-    if not keyboard:
-        await update.message.reply_text("❌ 현재 보유 중인(qty > 0) 종목이 없습니다.")
-        return
-
-    await update.message.reply_text(
-        "🚨 **전량 이익 매도 및 종료**\n\n종료할 종목을 선택하세요. 즉시 시장가/지정가 주문을 전송하고 사이클을 마무리합니다.", 
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def cmd_profit_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """누적 수익 기록 요약"""
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cp = utils.load_cumul_profit()
-    summary = utils.aggregate_cumul_profit_by_ticker(cp)
-    
-    if not summary:
-        await update.message.reply_text("📜 기록된 수익 내역이 없습니다.")
-        return
+    by_t = utils.aggregate_cumul_profit_by_ticker(cp)
 
-    msg = "📋 **종목별 누적 실현 수익**\n\n"
-    total_sum = 0.0
-    for tkr, val in sorted(summary.items()):
-        msg += f"- {tkr}: **${val:,.2f}**\n"
-        total_sum += val
-    
-    msg += f"\n💰 **총 누적 합계: ${total_sum:,.2f}**"
-    
-    keyboard = [[InlineKeyboardButton("📜 전체 상세 기록 보기", callback_data="profit_dive")]]
-    await update.message.reply_text(UIFormatter.clean_text(msg), reply_markup=InlineKeyboardMarkup(keyboard))
+    rows: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for t in STRATEGY:
+        tu = str(t).strip().upper()
+        rows.append((tu, float(by_t.get(tu, 0.0))))
+        seen.add(tu)
+    for tu in sorted(by_t.keys()):
+        if tu not in seen:
+            rows.append((tu, float(by_t[tu])))
+            seen.add(tu)
+
+    msg = "[무한매수 실현수익 보고서]\n"
+    total = 0.0
+    for ticker, profit in rows:
+        msg += f"  {ticker} 누적: ${profit:,.2f}\n"
+        total += profit
+
+    msg += "  ------------------\n"
+    msg += f"  총 합계: ${total:,.2f}\n"
+    await update.message.reply_text(msg)
 
 
 async def cmd_profit_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """수익 기록 초기화"""
-    # 안전장치: 인라인 버튼으로 재확인 (여기서는 간단히 명령어 인자로 체크)
-    if not context.args or context.args[0] != "CONFIRM":
-        await update.message.reply_text("⚠️ **수익 기록 초기화**\n\n정말 초기화하시려면 `/profit_reset CONFIRM` 이라고 입력하세요.\n이 작업은 되돌릴 수 없습니다.")
+    utils.save_cumul_profit({"history": [], "processed_orders": []})
+    await update.message.reply_text("누적 익절 수익 기록이 초기화되었습니다.")
+
+async def cmd_profit_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cp = utils.load_cumul_profit()
+    history = [h for h in (cp.get("history") or []) if isinstance(h, dict)]
+    by_ticker = utils.aggregate_cumul_profit_by_ticker(cp)
+
+    if not history:
+        if any(abs(v) > 1e-9 for v in by_ticker.values()):
+            lines = "\n".join(f"💰 {t}: ${v:,.2f}" for t, v in sorted(by_ticker.items()) if abs(v) > 1e-9)
+            await update.message.reply_text(
+                "📋 건별 익절 이력(history)은 없습니다.\n\n"
+                f"다만 cumul_profit.json에 종목별 누적만 있는 상태입니다:\n\n{lines}\n\n"
+                "· /report와 동일한 숫자입니다.\n"
+                "· 이후 봇이 목표가 익절 체결을 기록하면 여기에 날짜·건당 내역이 쌓입니다.\n"
+                "· 예전에 정규장 익절만 하고 기록 로직이 없던 때의 잔여일 수 있습니다."
+            )
+            return
+        await update.message.reply_text(
+            "📋 현재 기록된 실현 수익이 없습니다.\n\n"
+            "목표가에 도달한 봇 익절 매도 가 체결 확인되면 history에 자동으로 쌓입니다. 첫 익절을 응원합니다! 🚀"
+        )
         return
 
-    utils.save_cumul_profit({"history": [], "processed_orders": []})
-    await update.message.reply_text("✅ 모든 수익 기록이 초기화되었습니다.")
+    totals: dict[str, float] = {}
+    for h in history:
+        tx = str(h.get("ticker") or "").strip().upper()
+        if not tx:
+            continue
+        try:
+            totals[tx] = totals.get(tx, 0.0) + float(h.get("profit") or 0)
+        except (TypeError, ValueError):
+            continue
+
+    total_str = "\n".join(f"💰 {tx}: ${v:,.2f}" for tx, v in sorted(totals.items()))
+    msg = (
+        "📋 무한매수 실현 수익 요약 (history 기준)\n\n"
+        f"{total_str}\n\n"
+        "--- 최근 5건 (날짜 | 티커 | 버전 | 손익) ---\n"
+    )
+    for h in history[-5:]:
+        vlab = strategy.format_method_display(h.get("method"))
+        d = h.get("date", "?")
+        tic = str(h.get("ticker") or "?").strip().upper()
+        try:
+            val_p = float(h.get("profit") or 0)
+        except (TypeError, ValueError):
+            val_p = 0.0
+        msg += f"✅ {d} | {tic} | {vlab} | **${val_p:+,.2f}**\n"
+
+    keyboard = [[InlineKeyboardButton("🔍 전체 수익 기록 상세보기 (Deep-Dive)", callback_data="profit_dive")]]
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
 
 
 async def cmd_pre_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """프리마켓 감시 ON"""
     from config_manager import save_config
     if save_config({"ENABLE_PREMARKET": True}):
-        await update.message.reply_text("🕔 **프리마켓 감시가 활성화되었습니다.**\n장 시작 전 목표가 도달 시 알림 및 자동 매도를 시도합니다.")
+        from scheduler import register_schedules
+        register_schedules(context.job_queue, update.message.chat_id)
+        await update.message.reply_text("🟢 프리마켓 거래가 활성화되었습니다. 이제 NY 04:00부터 주가를 감시합니다.")
     else:
-        await update.message.reply_text("❌ 설정 변경 실패")
-
+        await update.message.reply_text("❌ 설정 저장에 실패했습니다.")
 
 async def cmd_pre_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """프리마켓 감시 OFF"""
     from config_manager import save_config
     if save_config({"ENABLE_PREMARKET": False}):
-        await update.message.reply_text("🔕 **프리마켓 감시가 비활성화되었습니다.**")
+        from scheduler import register_schedules
+        register_schedules(context.job_queue, update.message.chat_id)
+        await update.message.reply_text("🔴 프리마켓 거래가 비활성화되었습니다. 정규장(NY 09:35)에만 주문합니다.")
     else:
-        await update.message.reply_text("❌ 설정 변경 실패")
+        await update.message.reply_text("❌ 설정 저장에 실패했습니다.")
 
-
-# --- 콜백 및 내부 실행 로직 ---
-
-async def _execute_del_target(event, ticker: str):
-    """종목 삭제 실행"""
-    from config_manager import STRATEGY_SETTINGS, save_config
-    from state_manager import STRATEGY
+async def cmd_add_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 3:
+        msg = (
+            "➕ **종목 추가(Add Target) 가이드**\n\n"
+            "인자 없이 호출하면 이 안내만 표시됩니다. "
+            "RSI·차트는 증권사 앱/MTS나 별도 시세 도구에서 확인하세요.\n\n"
+            "**[참고] 흔히 쓰는 3배 레버리지 예시 티커**\n"
+            "`TQQQ` `UPRO` `SOXL` `TECL` `LABU` `NAIL` `DPST` … (투자 판단은 본인 책임)\n\n"
+            "**[방법론별 기본 익절목표 안내]**\n"
+            "• V2.2: 사용자 입력 적용 (기본 10%)\n"
+            "• V3.0·V4.0: TQQQ 15%, SOXL 20% (수익률 생략 가능)\n\n"
+            "**[사용법]**\n"
+            "1. 전량 입력: `/add_target 티커 시드 횟수 수익% 버전`\n"
+            "2. 수익 생략(TQQQ/SOXL): `/add_target 티커 시드 횟수 버전` (자동 15/20%)\n"
+            "3. 버전 생략: `/add_target 티커 시드 횟수 수익%` (V2.2)\n"
+            "4. 모두 생략: `/add_target 티커 시드 횟수` (10% / V2.2)\n\n"
+            "예: `/add_target TQQQ 3000 20 4.0` (V4.0, 15% 자동)"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
     
-    if ticker in STRATEGY_SETTINGS:
-        new_settings = dict(STRATEGY_SETTINGS)
-        del new_settings[ticker]
-        if save_config({"STRATEGY_SETTINGS": new_settings}):
-            # 런타임 상태 및 사이클 상태 정리
-            if ticker in STRATEGY: del STRATEGY[ticker]
-            utils.delete_ticker_from_all_states(ticker)
-            
-            await event.edit_message_text(f"✅ {ticker} 종목이 성공적으로 삭제되었습니다.")
+    ticker = args[0].upper()
+    try:
+        seed = float(args[1])
+        total_a = float(args[2])
+    except (IndexError, ValueError):
+        await update.message.reply_text("❌ 시드와 분할횟수는 숫자여야 합니다.")
+        return
+
+    # 지능적 인자 파싱 (add_target)
+    target_p = 10.0
+    method = "2.2"
+
+    if len(args) == 4:
+        val = args[3]
+        if val.lower() in ("3.0", "3", "v3", "v3.0", "4.0", "4", "v4", "v4.0"):
+            method = state_manager.normalize_strategy_method(val)
+            if ticker == "TQQQ": target_p = 15.0
+            elif ticker == "SOXL": target_p = 20.0
+        else:
+            try:
+                target_p = float(val)
+            except ValueError:
+                pass
+    elif len(args) >= 5:
+        try:
+            target_p = float(args[3])
+        except ValueError:
+            pass
+        method = state_manager.normalize_strategy_method(args[4])
+        # V3.0/V4.0: TQQQ/SOXL은 하드코딩 수익률 자동 적용 (사용자 입력 무시)
+        if method in ("3.0", "4.0"):
+            hp = _v30_v40_hardcoded_profit(ticker)
+            if hp is not None:
+                target_p = hp
+    else:
+        if ticker == "TQQQ": target_p = 15.0
+        elif ticker == "SOXL": target_p = 20.0
+
+    from config_manager import STRATEGY_SETTINGS, save_config
+    new_settings = dict(STRATEGY_SETTINGS)
+    prev = STRATEGY_SETTINGS.get(ticker, {})
+    entry = {**prev, "seed": seed, "total_a": total_a, "target_profit": target_p, "method": method}
+    new_settings[ticker] = entry
+
+    if save_config({"STRATEGY_SETTINGS": new_settings}):
+        STRATEGY[ticker] = _runtime_strategy_entry(ticker, entry)
+        m = STRATEGY[ticker]["method"]
+        effective_note = ""
+        if m in ("3.0", "4.0"):
+            if ticker == "TQQQ":
+                effective_note = f"\n⚠️ V{m} 적용: TQQQ 익절목표는 15%(고정)로 운용됩니다."
+            elif ticker == "SOXL":
+                effective_note = f"\n⚠️ V{m} 적용: SOXL 익절목표는 20%(고정)로 운용됩니다."
+        
+        await update.message.reply_text(
+            f"✅ {ticker} 설정 완료!\n- 시드: ${seed}\n- 횟수: {total_a}회\n- 목표: {target_p}%\n- 방식: {m}{effective_note}"
+        )
+    else:
+        await update.message.reply_text("❌ 설정 저장 실패")
+
+async def cmd_edit_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 3 and len(args) != 0:
+        await update.message.reply_text("❌ 사용법: `/edit_target 티커 시드 횟수 [수익%] [버젼]`")
+        return
+
+    if len(args) == 0:
+        from state_manager import STRATEGY
+        if not STRATEGY:
+            await update.message.reply_text("현재 투자 중인 종목이 없습니다.")
             return
-    await event.edit_message_text("❌ 삭제 실패")
+
+        msg = (
+            "📝 <b>수정할 종목을 선택하세요</b>\n\n"
+            "선택 후에는 단계별로 값을 입력합니다. (시드 → 분할횟수 → 목표수익률)\n"
+            "또는 한 줄로도 입력할 수 있습니다.\n"
+            "<code>시드 분할횟수 [수익%] [버전]</code>\n\n"
+            "<b>[방법론별 기본 익절목표 참고]</b>\n"
+            "• V2.2: 사용자 입력 적용 (기본 10%)\n"
+            "• V3.0·V4.0: TQQQ 15%, SOXL 20% (수익률 생략 가능)\n\n"
+            "취소하려면 <code>취소</code> 라고 입력하세요."
+        )
+        keyboard = []
+        for t in STRATEGY.keys():
+            keyboard.append([InlineKeyboardButton(f"📝 {t} 수정", callback_data=f"edit_pick:{t}")])
+        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    
+    ticker = args[0].upper()
+    from state_manager import STRATEGY
+    if ticker not in STRATEGY:
+        await update.message.reply_text(f"❌ {ticker} 종목은 현재 투자 대상이 아닙니다.")
+        return
+        
+    try:
+        seed = float(args[1])
+        total_a = float(args[2])
+    except (IndexError, ValueError):
+        await update.message.reply_text("❌ 시드와 분할횟수는 숫자여야 합니다.")
+        return
+
+    # 지능적 인자 파싱 (edit_target)
+    target_p = STRATEGY[ticker].get("target_profit", 10.0)
+    method = STRATEGY[ticker].get("method", "2.2")
+
+    if len(args) == 4:
+        val = args[3]
+        if val.lower() in ("3.0", "3", "v3", "v3.0", "4.0", "4", "v4", "v4.0"):
+            method = state_manager.normalize_strategy_method(val)
+            if ticker == "TQQQ": target_p = 15.0
+            elif ticker == "SOXL": target_p = 20.0
+        else:
+            try:
+                target_p = float(val)
+            except ValueError:
+                pass
+    elif len(args) >= 5:
+        try:
+            target_p = float(args[3])
+        except ValueError:
+            pass
+        method = state_manager.normalize_strategy_method(args[4])
+        # V3.0/V4.0: TQQQ/SOXL은 하드코딩 수익률 자동 적용 (사용자 입력 무시)
+        if method in ("3.0", "4.0"):
+            hp = _v30_v40_hardcoded_profit(ticker)
+            if hp is not None:
+                target_p = hp
+
+    from config_manager import STRATEGY_SETTINGS, save_config
+    new_settings = dict(STRATEGY_SETTINGS)
+    merged = {**STRATEGY_SETTINGS.get(ticker, {}), "seed": seed, "total_a": total_a, "target_profit": target_p, "method": method}
+    new_settings[ticker] = merged
+
+    if save_config({"STRATEGY_SETTINGS": new_settings}):
+        STRATEGY[ticker] = _runtime_strategy_entry(ticker, merged)
+        m = STRATEGY[ticker]["method"]
+        effective_note = ""
+        if m in ("3.0", "4.0"):
+            if ticker == "TQQQ":
+                effective_note = f"\n⚠️ V{m} 적용: TQQQ 익절목표는 15%(고정)로 운용됩니다."
+            elif ticker == "SOXL":
+                effective_note = f"\n⚠️ V{m} 적용: SOXL 익절목표는 20%(고정)로 운용됩니다."
+        
+        await update.message.reply_text(
+            f"✅ {ticker} 설정 변경 완료!\n- 시드: ${seed:,.0f}\n- 분할횟수: {total_a}회\n- 목표수익률: {target_p}%\n- 방식: {m}{effective_note}"
+        )
+    else:
+        await update.message.reply_text("❌ 설정 저장 실패")
+
+async def cmd_del_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from config_manager import STRATEGY_SETTINGS
+    args = context.args
+    
+    if not args:
+        if not STRATEGY_SETTINGS:
+            await update.message.reply_text("현재 등록된 종목이 없습니다.")
+            return
+            
+        keyboard = []
+        for ticker in STRATEGY_SETTINGS:
+            keyboard.append([InlineKeyboardButton(f"🗑️ {ticker} 삭제", callback_data=f"ask_del:{ticker}")])
+            
+        markup = InlineKeyboardMarkup(keyboard)
+        msg = (
+            "🗑️ **삭제할 종목을 선택하세요**\n\n"
+            "**주의사항:**\n"
+            "- 이 작업은 봇의 **감시 목록에서 해당 종목을 제외**합니다.\n"
+            "- 실제 증권 계좌에 있는 **주식은 매도되지 않습니다.**\n"
+            "- 봇이 더 이상 해당 종목을 관리하지 않게 됩니다."
+        )
+        await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=markup)
+        return
+    
+    ticker = args[0].upper()
+    await _execute_del_target(update, ticker)
+
+async def _execute_del_target(event, ticker):
+    from config_manager import STRATEGY_SETTINGS, save_config
+    if ticker not in STRATEGY_SETTINGS:
+        msg = f"대상 {ticker}를 찾을 수 없습니다."
+        if hasattr(event, 'reply_text'): await event.reply_text(msg)
+        else: await event.edit_message_text(msg)
+        return
+    
+    new_settings = dict(STRATEGY_SETTINGS)
+    del new_settings[ticker]
+    
+    if save_config({"STRATEGY_SETTINGS": new_settings}):
+        from state_manager import STRATEGY
+        if ticker in STRATEGY: del STRATEGY[ticker]
+        
+        # 모든 상태 파일 정리 (cumul_profit history 보존 포함)
+        utils.delete_ticker_from_all_states(ticker)
+        
+        msg = f"🗑️ **{ticker} 삭제 완료!**\n\n이제 봇이 {ticker} 종목을 더 이상 감시하거나 매매하지 않습니다."
+        if hasattr(event, 'reply_text'): await event.reply_text(msg, parse_mode='Markdown')
+        else: await event.edit_message_text(msg, parse_mode='Markdown')
+    else:
+        msg = "❌ 설정 저장 실패"
+        if hasattr(event, 'reply_text'): await event.reply_text(msg)
+        else: await event.edit_message_text(msg)
 
 
-async def _execute_liquidate(event, ticker: str, ord_type: str = "02"):
-    """전량 매도 실행 로직"""
+async def cmd_liquidate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from state_manager import STRATEGY
+    args = context.args
+    
+    if not args:
+        # 보유 중인 종목 리스트 추출
+        liquid_targets = [t for t in STRATEGY if STRATEGY[t]["data"]["qty"] > 0]
+        if not liquid_targets:
+            await update.message.reply_text("보유 수량이 있는 종목이 없습니다.")
+            return
+            
+        keyboard = []
+        for ticker in liquid_targets:
+            keyboard.append([InlineKeyboardButton(f"🚨 {ticker} 전량 매도", callback_data=f"ask_liq:{ticker}")])
+            
+        markup = InlineKeyboardMarkup(keyboard)
+        msg = (
+            "🚨 **전량 매매 및 종료(Liquidate) 안내**\n\n"
+            "이 명령은 다음 작업을 수행합니다:\n"
+            "1. 해당 종목의 **모든 잔고를 시장가(MOC)로 즉시 매도**합니다.\n"
+            "2. 봇의 투자 대상 목록에서 **해당 종목 설정을 삭제**합니다.\n"
+            "3. 즉, 해당 종목에 대한 **무한매수 투자를 완전히 종료**합니다.\n\n"
+            "매도할 종목을 선택해 주세요:"
+        )
+        await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=markup)
+        return
+    
+    ticker = args[0].upper()
+    await _execute_liquidate(update, ticker)
+
+async def _execute_liquidate(event, ticker, ord_type="02"):
+    from state_manager import STRATEGY
+    if ticker not in STRATEGY:
+        msg = "해당 종목을 찾을 수 없습니다."
+        if hasattr(event, 'reply_text'): await event.reply_text(msg)
+        else: await event.edit_message_text(msg)
+        return
+    
     qty = STRATEGY[ticker]["data"]["qty"]
     if qty <= 0:
-        await event.edit_message_text(f"❌ {ticker} 보유 수량이 없습니다.")
+        msg = "보유 수량이 없습니다."
+        if hasattr(event, 'reply_text'): await event.reply_text(msg)
+        else: await event.edit_message_text(msg)
         return
         
     ord_type_name = "시장가(MOC)" if ord_type == "02" else "지정가"
@@ -1021,10 +1425,7 @@ async def _reply_long_markdown(message, text: str) -> None:
 
 async def _cb_guide(update, context, query, parts):
     guide_type = parts[1]
-    content = guide_theory.THEORY_22 if guide_type == "theory_22" else \
-              guide_theory.THEORY_30 if guide_type == "theory_30" else \
-              guide_theory.THEORY_40 if guide_type == "theory_40" else \
-              guide_theory.THEORY_COMPARE if guide_type == "theory_compare" else ""
+    content = GUIDE_TEXTS.get(guide_type, "")
     if not content:
         await query.message.reply_text("해당 가이드가 없습니다.")
         return
@@ -1364,7 +1765,6 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if err is not None:
-        import traceback
         tb = getattr(err, "__traceback__", None)
         log.error(
             "Telegram handler error: %s\n%s",

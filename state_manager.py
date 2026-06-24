@@ -43,13 +43,20 @@ def sync_account():
         res_bal = kis_client.query_account_raw()
         
         # [방어] API 응답이 정상이 아니면 기존 상태를 보존 (Fail-Safe)
+        # API 일시 장애 시 보유량을 0으로 덮어써서 중복 매수가 발생하는 것을 방지합니다.
         if not res_bal or res_bal.get('rt_cd') != '0':
             rt_cd_val = res_bal.get('rt_cd') if res_bal else 'None'
             msg1_val = res_bal.get('msg1', '') if res_bal else '응답 없음'
             return False, f"KIS 잔고 조회 실패 (rt_cd={rt_cd_val}: {msg1_val}). 기존 상태를 유지합니다."
 
+        # API 정상 응답 확인 후에만 초기화 → 매핑
+        # [수정] 먼저 모든 STRATEGY 종목의 보유량을 0으로 리셋합니다.
+        # → 전량 매도된 종목은 API output1에 아예 포함되지 않기 때문에,
+        #   이렇게 하지 않으면 이전 보유수량이 그대로 남는 버그가 발생합니다.
         import utils
+        prev_qtys = {}
         for tk in STRATEGY:
+            prev_qtys[tk] = float(STRATEGY[tk]["data"].get("qty", 0) or 0.0)
             STRATEGY[tk]["data"] = {"avg": 0.0, "qty": 0.0, "cumul": 0.0}
 
         for item in res_bal.get('output1', []):
@@ -60,9 +67,16 @@ def sync_account():
                 STRATEGY[ticker]["data"] = {"avg": avg, "qty": qty, "cumul": avg * qty}
 
                 if qty > 0:
-                    utils.update_cycle_info(ticker, start_date=utils.get_us_today())
+                    prev_q = prev_qtys.get(ticker, 0.0)
+                    if prev_q <= 0:
+                        # 0주에서 1주 이상으로 변경 시 회차 증가를 포함하여 새 사이클 시작
+                        utils.start_cycle_for_new_entry(ticker, increment_on_reentry=True)
+                    else:
+                        # 기존에 보유하고 있던 경우에는 단순 시작일/상태 보존
+                        utils.update_cycle_info(ticker, start_date=utils.get_us_today())
 
         import v3_state
+
         for tk in STRATEGY:
             if STRATEGY[tk].get("method") != "3.0":
                 continue
@@ -76,7 +90,9 @@ def sync_account():
         cash, source = kis_client.query_available_cash(token)
         CURRENT_CASH = cash
 
+        # 보유 중일 때만 갱신. 전량 매도 후에도 키는 유지(직전 평단) → 장마감 reconcile용.
         import utils as _utils_lk
+
         lk = _utils_lk.load_last_known_hold_avgs()
         for tk in STRATEGY:
             d = STRATEGY[tk]["data"]
@@ -87,6 +103,7 @@ def sync_account():
         _utils_lk.save_last_known_hold_avgs(lk)
 
         import strategy
+
         pending_bits = []
         for tk in STRATEGY:
             if STRATEGY[tk].get("method") == "4.0":

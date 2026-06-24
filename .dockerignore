@@ -1,0 +1,27 @@
+# Data and state files (이미지에는 코드만; 런타임은 볼륨·바인드 마운트)
+*.dat
+*.json
+*.db
+!requirements.txt
+!trading_settings.json
+
+# 시크릿은 이미지에 넣지 않음 — NAS/배포 시 env 또는 마운트
+.env
+.env.*
+
+# Python temporary files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS temporary files
+.DS_Store
+Thumbs.db
+
+# Docker files
+Dockerfile
+docker-compose.yaml
+.dockerignore
+
+# Log files
+*.log
