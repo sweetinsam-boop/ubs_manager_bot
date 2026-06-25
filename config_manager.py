@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from dotenv import load_dotenv
 
-from storage.paths import get_path, TRADING_SETTINGS_FILE
+from storage.paths import get_path, TRADING_SETTINGS_FILE, BASE_DIR
 from storage.file_store import load_json, save_json
 from bot_logging import get_logger
 
@@ -26,7 +26,20 @@ def load_config():
         "ACNT_PRDT_CD": os.environ.get("ACNT_PRDT_CD", "")
     }
 
-trading_data = load_json(get_path(TRADING_SETTINGS_FILE), default={})
+# [Fail-Safe] 만약 storage/trading_settings.json 이 존재하지 않는데 루트에 존재한다면 복사해옵니다.
+settings_path = get_path(TRADING_SETTINGS_FILE)
+if not settings_path.exists():
+    root_settings = BASE_DIR / TRADING_SETTINGS_FILE
+    if root_settings.exists():
+        import shutil
+        try:
+            os.makedirs(settings_path.parent, exist_ok=True)
+            shutil.copy2(root_settings, settings_path)
+            log.info("[Fail-Safe] Copied trading_settings.json from project root to storage/")
+        except Exception as e:
+            log.warning("[Fail-Safe] Failed to copy trading_settings.json: %s", e)
+
+trading_data = load_json(settings_path, default={})
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 APP_KEY = os.environ.get("APP_KEY")

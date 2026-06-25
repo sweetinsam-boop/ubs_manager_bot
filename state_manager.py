@@ -40,7 +40,9 @@ def sync_account():
         token = kis_client.get_kis_access_token()
         if not token:
             return False, "KIS 액세스 토큰을 받지 못했습니다. APP_KEY·APP_SECRET·네트워크를 확인하세요."
-        res_bal = kis_client.query_account_raw()
+        
+        # exchange_code를 공백("")으로 넘겨 미국 전체 거래소(나스닥, 아멕스, 뉴욕) 잔고를 1회에 일괄 조회합니다.
+        res_bal = kis_client.query_account_raw("")
         
         # [방어] API 응답이 정상이 아니면 기존 상태를 보존 (Fail-Safe)
         # API 일시 장애 시 보유량을 0으로 덮어써서 중복 매수가 발생하는 것을 방지합니다.

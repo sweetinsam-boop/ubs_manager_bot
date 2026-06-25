@@ -245,7 +245,7 @@ def kis_api_call(method, url, headers, params=None, data=None):
 
     return None
 
-def query_account_raw():
+def query_account_raw(exchange_code=""):
     token = get_kis_access_token()
     if not token:
         log.warning("query_account_raw: no access token")
@@ -257,7 +257,7 @@ def query_account_raw():
         "appkey": APP_KEY, "appsecret": APP_SECRET, "tr_id": "TTTS3012R", "custtype": "P"
     }
     params = {
-        "CANO": CANO, "ACNT_PRDT_CD": ACNT_PRDT_CD, "OVRS_EXCG_CD": "NASD",
+        "CANO": CANO, "ACNT_PRDT_CD": ACNT_PRDT_CD, "OVRS_EXCG_CD": exchange_code,
         "TR_CRCY_CD": "USD", "CTX_AREA_FK200": "", "CTX_AREA_NK200": ""
     }
     return kis_api_call("GET", url, headers, params=params)
@@ -276,9 +276,11 @@ def query_available_cash(token, debug=False):
             "Content-Type": "application/json", "authorization": f"Bearer {token}",
             "appkey": APP_KEY, "appsecret": APP_SECRET, "tr_id": "TTTS3007R", "custtype": "P"
         }
+        # [WARNING] OVRS_EXCG_CD가 NASD일 때, ITEM_CD 역시 나스닥 상장 종목(TQQQ 등)이어야 정상 연동됩니다.
+        # SOXL(AMEX)과 NASD 조합은 KIS API 매칭 실패를 유발하므로 절대 변경하지 마십시오.
         params = {
             "CANO": CANO, "ACNT_PRDT_CD": ACNT_PRDT_CD,
-            "OVRS_EXCG_CD": "NASD", "OVRS_ORD_UNPR": "1", "ITEM_CD": "SOXL"
+            "OVRS_EXCG_CD": "NASD", "OVRS_ORD_UNPR": "1", "ITEM_CD": "TQQQ"
         }
         res = kis_api_call("GET", url, headers, params=params)
         if res is None:
@@ -348,7 +350,17 @@ def get_exchange_rate():
 EXCHANGE_CODE = {} # 빈 사전으로 시작하여 get_exchange_code에서 동적으로 채워짐
 
 def get_exchange_code(ticker):
-    """KIS 거래소 코드 반환. MCP 문서 기준 NASD = 미국 전체(나스닥+뉴욕+아멕스)."""
+    """
+    [CRITICAL] KIS 거래소 코드 반환. 
+    실전투자 주문 API 기준 TQQQ=NASD, SOXL=AMEX를 사용합니다.
+    TQQQ(나스닥)와 SOXL(아멕스)의 상장 거래소가 상이하므로, 리팩토링 시 절대 하드코딩하거나 통일하지 마십시오.
+    """
+    tk = str(ticker).strip().upper()
+    if tk in ("TQQQ", "SQQQ", "TSLA", "AAPL", "NVDA", "MSFT", "GOOGL"):
+        return "NASD"
+    elif tk in ("SOXL",):
+        return "AMEX"
+    # 기본 fallback
     return "NASD"
 
 def send_order(ticker, qty, price, side="BUY", order_type="00", max_retries=2):
@@ -466,7 +478,16 @@ def cancel_order(ticker, order_no, qty, max_retries=2):
 PRICE_EXCHANGE_CODE = {} # get_price_exchange_code에서 동적으로 채워짐
 
 def get_price_exchange_code(ticker):
-    """KIS 시세 조회용 거래소 코드 반환. 미국 시세 API는 3자 코드 NAS 사용."""
+    """
+    [CRITICAL] KIS 시세 조회용 거래소 코드 반환. 
+    미국 시세 API는 나스닥=NAS, 아멕스=AMS, 뉴욕=NYS를 사용합니다.
+    TQQQ(NAS)와 SOXL(AMS)의 시세 조회용 거래소 코드가 상이하므로 절대 통일하거나 하드코딩하지 마십시오.
+    """
+    tk = str(ticker).strip().upper()
+    if tk in ("TQQQ", "SQQQ", "TSLA", "AAPL", "NVDA", "MSFT", "GOOGL"):
+        return "NAS"
+    elif tk in ("SOXL",):
+        return "AMS"
     return "NAS"
 
 
@@ -493,7 +514,7 @@ def get_current_price(ticker):
                     "tr_id": "HHDFS00000300",
                     "custtype": "P",
                 }
-                params = {"AUTH": "", "EXCD": "NAS", "SYMB": ticker}
+                params = {"AUTH": "", "EXCD": get_price_exchange_code(ticker), "SYMB": ticker}
                 res = kis_api_call("GET", url, headers, params=params)
                 if res and res.get('rt_cd') == '0':
                     last = float(res.get('output', {}).get('last', '0'))
@@ -540,7 +561,7 @@ def get_prev_close(ticker):
                     "tr_id": "HHDFS00000300",
                     "custtype": "P"
                 }
-                params = {"AUTH": "", "EXCD": "NAS", "SYMB": ticker}
+                params = {"AUTH": "", "EXCD": get_price_exchange_code(ticker), "SYMB": ticker}
                 res = kis_api_call("GET", url, headers, params=params)
                 if res and res.get('rt_cd') == '0':
                     base = float(res.get('output', {}).get('base', '0'))
@@ -1078,7 +1099,7 @@ def query_unfilled_orders_raw(ticker: str = "", max_pages: int = 5) -> list:
         params = {
             "CANO": CANO,
             "ACNT_PRDT_CD": ACNT_PRDT_CD,
-            "OVRS_EXCG_CD": "NASD",
+            "OVRS_EXCG_CD": get_exchange_code(ticker),
             "SORT_SQN": "DS",
             "CTX_AREA_NK200": nk200,
             "CTX_AREA_FK200": fk200,
