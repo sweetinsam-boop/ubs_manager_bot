@@ -215,7 +215,6 @@ def main_reply_keyboard_markup() -> ReplyKeyboardMarkup:
         ["📈 수익보고(/report)"],
         ["신규동기화(/sync)", "🧾 수동주문(/manual_order)"],
         ["📚 도움말(/help)", "📋 수익기록(/profit_history)"],
-        ["🕔 프리마켓 ON", "🔕 프리마켓 OFF"],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -233,7 +232,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚀 **무한매수봇 2.0 - 당신의 개인 투자 비서**\n\n"
         "봇이 정상적으로 가동되었습니다! 설정하신 전략에 따라 매일 밤 자동으로 매매를 수행합니다.\n\n"
         "⏰ **핵심 자동화 스케줄 (한국 시간 기준)**\n"
-        "• **17:00 / 18:00**: 프리마켓 감시 시작 (설정 시)\n"
         "• **22:35 / 23:35**: 정규장 오픈 및 일일 주문 전송\n"
         "• **05:00 / 06:00**: 정규장 마감 알림\n"
         "• **장 마감 후(미국 동부, `trading_settings.json`의 `POST_CLOSE_SYNC_NY`, 기본 16:40)**: 계좌 자동 동기화(`/sync`와 동일)\n"
@@ -257,7 +255,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Day M: 목표 수익률 도달 시 전량 익절 매도 → 사이클 종료 보고\n\n"
         "<b>명령어</b>\n"
         "- <b>조회</b>: <code>/status</code>(현황+최근 주문·체결), <code>/cash</code>(예수금/보유), <code>/report</code>(누적 수익), <code>/profit_history</code>(익절 기록), <code>/logs</code>(최근 24시간 서버 로그)\n"
-        "- <b>제어</b>: <code>/sync</code>(계좌 동기화), <code>/manual_order</code>(수동 주문), <code>/pre_on</code>(프리마켓 감시 ON), <code>/pre_off</code>(OFF)\n"
+        "- <b>제어</b>: <code>/sync</code>(계좌 동기화), <code>/manual_order</code>(수동 주문)\n"
         "- <b>설정</b>: <code>/add_target</code>(추가), <code>/edit_target</code>(수정), <code>/del_target</code>(삭제)\n"
         "- <b>긴급</b>: <code>/liquidate</code>(전량 매도 및 종료)\n\n"
         "<b>무한매수법 3.0</b>\n"
@@ -510,24 +508,6 @@ async def cmd_profit_history(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-
-async def cmd_pre_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from config_manager import save_config
-    if save_config({"ENABLE_PREMARKET": True}):
-        from scheduler import register_schedules
-        register_schedules(context.job_queue, update.message.chat_id)
-        await update.message.reply_text("🟢 프리마켓 거래가 활성화되었습니다. 이제 NY 04:00부터 주가를 감시합니다.")
-    else:
-        await update.message.reply_text("❌ 설정 저장에 실패했습니다.")
-
-async def cmd_pre_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from config_manager import save_config
-    if save_config({"ENABLE_PREMARKET": False}):
-        from scheduler import register_schedules
-        register_schedules(context.job_queue, update.message.chat_id)
-        await update.message.reply_text("🔴 프리마켓 거래가 비활성화되었습니다. 정규장(NY 09:35)에만 주문합니다.")
-    else:
-        await update.message.reply_text("❌ 설정 저장에 실패했습니다.")
 
 async def cmd_add_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -1782,8 +1762,6 @@ async def post_init(application):
         BotCommand("report", "📈 수익보고"),
         BotCommand("sync", "🔄 신규동기화"),
         BotCommand("manual_order", "🧾 수동주문"),
-        BotCommand("pre_on", "🕔 프리마켓 ON"),
-        BotCommand("pre_off", "🔕 프리마켓 OFF"),
         BotCommand("help", "📚 도움말"),
         BotCommand("profit_history", "📋 수익기록"),
         BotCommand("add_target", "➕ 종목추가"),

@@ -10,7 +10,7 @@ import strategy
 import state_manager
 import utils
 import v4_state
-from config_manager import STRATEGY_SETTINGS, ENABLE_PREMARKET
+from config_manager import STRATEGY_SETTINGS
 from bot_logging import get_logger
 
 log = get_logger(__name__)
@@ -38,7 +38,6 @@ class TradeService:
             "recorded_at": datetime.datetime.now(pytz.timezone('Asia/Seoul')).strftime('%m-%d %H:%M:%S'),
             "market_session": utils.get_market_session_kr(),
             "is_closed": utils.get_market_session() == 'closed',
-            "premarket_on": ENABLE_PREMARKET,
             "tickers": [],
             "recent_orders": [],
             "current_cash": state_manager.CURRENT_CASH,
@@ -473,7 +472,7 @@ class TradeService:
     def reconcile_daily_sell_profits(pre_sync_avgs: dict[str, float]) -> list[str]:
         """
         장 마감 후 당일 체결된 매도 주문의 실현 수익을 cumul_profit에 반영합니다.
-        프리마켓 익절 경로 외에도, 정규장 LOC/지정가 매도 체결의 수익이 누락되지 않도록 합니다.
+        정규장 LOC/지정가 매도 체결의 수익이 누락되지 않도록 합니다.
 
         Args:
             pre_sync_avgs: 동기화 전 캡처한 {ticker: avg_price}

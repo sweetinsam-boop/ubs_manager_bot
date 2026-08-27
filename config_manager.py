@@ -47,7 +47,6 @@ APP_SECRET = os.environ.get("APP_SECRET")
 CANO = os.environ.get("CANO", "")
 ACNT_PRDT_CD = os.environ.get("ACNT_PRDT_CD", "")
 
-ENABLE_PREMARKET = trading_data.get("ENABLE_PREMARKET", False)
 STRATEGY_SETTINGS = trading_data.get("STRATEGY_SETTINGS", {})
 
 def get_post_close_sync_ny_time() -> tuple[int, int]:
@@ -77,9 +76,6 @@ def save_config(updates):
         save_json(get_path(TRADING_SETTINGS_FILE), current_settings, ensure_ascii=False, indent=4)
         
         # 전역 변수 업데이트
-        if "ENABLE_PREMARKET" in updates:
-            global ENABLE_PREMARKET
-            ENABLE_PREMARKET = updates["ENABLE_PREMARKET"]
         if "STRATEGY_SETTINGS" in updates:
             global STRATEGY_SETTINGS
             STRATEGY_SETTINGS = updates["STRATEGY_SETTINGS"]

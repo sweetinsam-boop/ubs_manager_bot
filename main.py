@@ -30,8 +30,6 @@ COMMAND_HANDLERS = [
     ("del_target", telegram_bot.cmd_del_target),
     ("edit_target", telegram_bot.cmd_edit_target),
     ("liquidate", telegram_bot.cmd_liquidate),
-    ("pre_on", telegram_bot.cmd_pre_on),
-    ("pre_off", telegram_bot.cmd_pre_off),
     ("logs", telegram_bot.cmd_logs),
 ]
 
@@ -43,8 +41,6 @@ BUTTON_ALIASES = [
     (r"^🧾 수동주문", telegram_bot.cmd_manual_order),
     (r"^📚 도움말", telegram_bot.cmd_help),
     (r"^📈 수익보고", telegram_bot.cmd_report),
-    (r"^🕔 프리마켓 ON", telegram_bot.cmd_pre_on),
-    (r"^🔕 프리마켓 OFF", telegram_bot.cmd_pre_off),
     (r"^📋 수익기록", telegram_bot.cmd_profit_history),
 ]
 

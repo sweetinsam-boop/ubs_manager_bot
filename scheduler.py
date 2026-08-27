@@ -27,70 +27,6 @@ log = get_logger(__name__)
 
 _daily_trade_running = False
 
-async def premarket_target_check(context: ContextTypes.DEFAULT_TYPE):
-    if not config_manager.ENABLE_PREMARKET: return
-    chat_id = context.job.chat_id
-    tz_ny = pytz.timezone('America/New_York')
-    now_ny = datetime.datetime.now(tz_ny)
-
-    # 뉴욕 시간 기준 프리마켓 시간 (04:00~09:30)
-    if not (4 <= now_ny.hour < 9 or (now_ny.hour == 9 and now_ny.minute < 30)): return
-    if not utils.is_market_open_today(): return
-
-    for ticker in STRATEGY:
-        if utils.check_trade_lock(ticker): continue
-        
-        curr_p = await asyncio.to_thread(kis_client.get_current_price, ticker)
-        s = STRATEGY[ticker]
-        avg_p = s["data"].get("avg", 0)
-
-        tgt_pct = strategy.profit_target_pct(ticker)
-        if avg_p > 0 and curr_p >= (avg_p * (1 + tgt_pct / 100)):
-            await asyncio.to_thread(state_manager.sync_account)
-            
-            s = STRATEGY[ticker]
-            d = s["data"]
-            avg_p = d.get("avg", 0)
-            qty_t = int(d.get("qty", 0))
-
-            if avg_p <= 0 or qty_t <= 0: continue
-
-            target_p = avg_p * (1 + tgt_pct / 100)
-            if curr_p >= target_p:
-                profit_rt = (curr_p - avg_p) / avg_p * 100
-                one_time = strategy.one_time_for_strategy(s)
-                entry_p = round(curr_p * 1.15, 2)
-                entry_qty = math.floor(one_time / curr_p)
-
-                now_kst = datetime.datetime.now(pytz.timezone('Asia/Seoul'))
-                now_ny = datetime.datetime.now(pytz.timezone('America/New_York'))
-                alert_msg = f"[프리마켓 목표가 돌파] {now_kst.strftime('%m-%d %H:%M')} KST / {now_ny.strftime('%H:%M')} NY\n\n"
-                alert_msg += f"[{ticker}] 현재가: ${curr_p:.2f} >= 목표가: ${target_p:.2f} (+{tgt_pct:.1f}%)\n"
-                alert_msg += f"  평단: ${avg_p:.2f} / 수익률: {profit_rt:+.1f}%\n"
-                alert_msg += f"  전량 매도({qty_t}주) 주문 실행!\n"
-                await notifier.broadcast_alert(chat_id, UIFormatter.clean_text(alert_msg))
-
-                res_sell = await asyncio.to_thread(
-                    kis_client.send_order, ticker, qty_t, curr_p, "SELL", "00"
-                )
-                sell_success = res_sell.get('rt_cd') == '0'
-
-                result_msg = f"[{ticker} 프리마켓 매도 주문]\n"
-                result_msg += f"지정가 매도 {qty_t}주 ${curr_p:.2f}: {'주문 접수' if sell_success else '실패('+res_sell.get('msg1','')+')'}\n"
-
-                if sell_success:
-                    order_no = res_sell.get("output", {}).get("ODNO", "")
-                    result_msg += f"주문번호: {order_no}\n"
-                    await notifier.broadcast_alert(chat_id, UIFormatter.clean_text(result_msg))
-                    await _complete_target_profit_sell_after_accept(
-                        context, ticker, float(avg_p), qty_t, order_no, entry_qty, entry_p
-                    )
-                else:
-                    # [수정] 매도 주문 자체가 실패한 경우 lock을 걸지 않음
-                    # → 정규장에서 다시 매매 기회를 가질 수 있도록 함
-                    await notifier.broadcast_alert(chat_id, UIFormatter.clean_text(result_msg))
-                    log.warning("premarket sell order failed for %s, NOT locking", ticker)
-
 async def daily_market_check(context: ContextTypes.DEFAULT_TYPE):
     global _daily_trade_running
     chat_id = context.job.chat_id
@@ -391,29 +327,27 @@ async def _complete_target_profit_sell_after_accept(
         kis_client.check_order_filled, on, ticker, "SELL", 10, 3
     )
     if not filled:
-        # [수정] 프리마켓 미체결 시: 주문 취소 시도 후 lock을 걸지 않음
-        # → 정규장에서 DCA(격자 매수) 기회를 놓치지 않도록 함
         cancel_msg = ""
         try:
             cancel_res = await asyncio.to_thread(
                 kis_client.cancel_order, ticker, on, qty_ordered
             )
             if cancel_res.get("rt_cd") == "0":
-                cancel_msg = "미체결 주문 취소 완료. 정규장 매매를 정상 진행합니다."
-                log.info("premarket unfilled sell cancelled: %s, odno=%s", ticker, on)
+                cancel_msg = "미체결 주문 취소 완료."
+                log.info("unfilled sell cancelled: %s, odno=%s", ticker, on)
             else:
                 cancel_msg = f"주문 취소 실패({cancel_res.get('msg1', '')}). 수동 확인 필요."
                 utils.set_trade_lock(ticker)  # 취소 실패 시에만 안전하게 잠금
-                log.warning("premarket cancel failed: %s, odno=%s, result=%s", ticker, on, cancel_res)
+                log.warning("cancel failed: %s, odno=%s, result=%s", ticker, on, cancel_res)
         except Exception as e:
             cancel_msg = f"주문 취소 중 오류({e}). 수동 확인 필요."
             utils.set_trade_lock(ticker)
-            log.warning("premarket cancel error: %s, %s", ticker, e)
+            log.warning("cancel error: %s, %s", ticker, e)
 
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"[{ticker}] 프리마켓 매도 체결이 확인되지 않았습니다.\n"
+                f"[{ticker}] 매도 체결이 확인되지 않았습니다.\n"
                 f"{cancel_msg}\n"
                 "필요 시 `/sync` 로 상태를 확인하세요."
             ),
@@ -469,27 +403,6 @@ async def market_close_report(context: ContextTypes.DEFAULT_TYPE):
 
     report = await generate_combined_report(is_full=False, title="[장 마감 종합 리포트]")
     await notifier.broadcast_alert(chat_id, report)
-
-async def premarket_start_alert(context: ContextTypes.DEFAULT_TYPE):
-    """프리마켓 시작 알림 (KST 17:00/18:00)"""
-    if not config_manager.ENABLE_PREMARKET: return
-    chat_id = context.job.chat_id
-    if not utils.is_market_open_today(): return
-    
-    msg = "🌅 **[감시 시작] 프리마켓이 시작되었습니다.**\n"
-    msg += "봇이 목표가 도달 여부를 실시간으로 감시합니다. (NY 04:00)"
-    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
-
-async def token_renewal_check(context: ContextTypes.DEFAULT_TYPE):
-    """
-    [Deprecated] 주기적 강제 재발급은 KIS의 24시간/1분 발급 정책상 의미가 없습니다.
-    24시간 안에는 동일 키만 돌려주며, 분당 1회 재발급 제한도 있어 호출 자체가 낭비입니다.
-    토큰 갱신은 만료 시각 도래 또는 API 응답의 만료 시그널을 받았을 때 자동으로 이뤄집니다
-    (kis_client.get_kis_access_token / kis_api_call 참조).
-    하위 호환을 위해 함수는 남겨두되 캐시 검사만 수행합니다(필요 시 자연스럽게 신규 발급).
-    """
-    await asyncio.to_thread(kis_client.get_kis_access_token)
-
 
 async def periodic_performance_log_update(context: ContextTypes.DEFAULT_TYPE):
     """performance_log를 주기적으로 갱신. 오늘 스냅샷 + 누락된 거래일 KIS 보강."""
@@ -594,9 +507,6 @@ def register_schedules(job_queue, chat_id):
     # KST 08:00 정산: 일·월 아침 제외 (토~일 장 휴무 직후 리포트는 의미가 적음) → 화~토만 (PTB 20+: 2~6)
     job_queue.run_daily(settlement_check, time=datetime.time(8, 0, tzinfo=kst), days=(2, 3, 4, 5, 6), chat_id=chat_id)
     job_queue.run_daily(market_close_alert, time=datetime.time(16, 0, tzinfo=tz_ny), days=(1, 2, 3, 4, 5), chat_id=chat_id)
-    job_queue.run_daily(premarket_start_alert, time=datetime.time(4, 0, tzinfo=tz_ny), days=(1, 2, 3, 4, 5), chat_id=chat_id)
-    # 토큰은 24시간 발급 정책 + 1분 재발급 제한이 있어 주기 강제 재발급은 무의미하며, 오히려 호출 낭비.
-    # 만료 도래·API 만료 시그널 수신 시 kis_client에서 자동으로 재발급하므로 주기 잡은 등록하지 않음.
     job_queue.run_repeating(
         periodic_performance_log_update,
         interval=14400,
@@ -604,8 +514,6 @@ def register_schedules(job_queue, chat_id):
         chat_id=chat_id,
         name=f"perf_log_{chat_id}",
     )
-    if config_manager.ENABLE_PREMARKET:
-        job_queue.run_repeating(premarket_target_check, interval=300, first=30, chat_id=chat_id, name=f"premarket_{chat_id}")
     # post_close_sync_job(기본 16:40)보다 먼저 돌면 sync 후 메모리 0 → 평단 캡처 실패·회차 미반영.
     # 장마감 동기화·매도수익 반영 이후에 스냅샷을 남기도록 16:50으로 둡니다.
     job_queue.run_daily(record_daily_performance, time=datetime.time(16, 50, tzinfo=tz_ny), days=(1, 2, 3, 4, 5), chat_id=chat_id)

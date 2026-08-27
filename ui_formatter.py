@@ -13,7 +13,6 @@ class UIFormatter:
         msg += f"기록시점: {data['recorded_at']}\n"
         
         market_label = f"미국 {data['us_date_display']} 정규장 종료" if data['is_closed'] else data['market_session']
-        if data['premarket_on']: market_label += " (프리마켓 감시 진행중)"
         msg += f"시장세션: {market_label}\n"
         msg += "--------------------------\n"
 
@@ -74,6 +73,8 @@ class UIFormatter:
             msg += "[총합 포트폴리오 손익]\n=> 현금 100% 보유\n"
 
         msg += f"보유 달러 예수금: ${data['current_cash']:,.2f}\n"
+        total_asset = data["total_value"] + data["current_cash"]
+        msg += f"계좌 총 평가금액: ${total_asset:,.2f}\n"
 
         return msg
 

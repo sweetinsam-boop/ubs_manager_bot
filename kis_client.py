@@ -416,7 +416,7 @@ def send_order(ticker, qty, price, side="BUY", order_type="00", max_retries=2):
 def cancel_order(ticker, order_no, qty, max_retries=2):
     """
     해외주식 주문 취소 (TTTT1004U).
-    프리마켓 미체결 지정가 매도 등을 수동 취소할 때 사용합니다.
+    미체결 지정가 매도 등을 수동 취소할 때 사용합니다.
 
     Args:
         ticker: 종목 코드

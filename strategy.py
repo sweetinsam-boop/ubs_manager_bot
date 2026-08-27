@@ -136,7 +136,7 @@ def v30_limit_pct_3q(ticker: str, s: dict) -> float:
 
 
 def profit_target_pct(ticker: str) -> float:
-    """프리마켓·전량익절 판단용 목표 수익률(%)."""
+    """전량익절 판단용 목표 수익률(%)."""
     s = STRATEGY[ticker]
     if _is_v40(s) or _is_v30(s):
         return v30_limit_pct_3q(ticker, s)
