@@ -1756,19 +1756,20 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application):
     """봇 초기화: 메뉴 명령어 등록, 스케줄 복원, 누락 정산 체크."""
+    # 순서: 도움말 -> 조회 -> 제어 -> 설정 -> 위험(청산). main.py COMMAND_HANDLERS와 동일한 분류.
     commands = [
+        BotCommand("help", "📚 도움말"),
         BotCommand("status", "📊 현황보기"),
         BotCommand("cash", "💰 예수금확인"),
         BotCommand("report", "📈 수익보고"),
+        BotCommand("profit_history", "📋 수익기록"),
+        BotCommand("logs", "📋 최근 24시간 로그"),
         BotCommand("sync", "🔄 신규동기화"),
         BotCommand("manual_order", "🧾 수동주문"),
-        BotCommand("help", "📚 도움말"),
-        BotCommand("profit_history", "📋 수익기록"),
         BotCommand("add_target", "➕ 종목추가"),
         BotCommand("edit_target", "📝 종목수정"),
         BotCommand("del_target", "🗑️ 종목삭제"),
         BotCommand("liquidate", "🚨 전량이익매도 및 종료"),
-        BotCommand("logs", "📋 최근 24시간 로그"),
     ]
     await application.bot.set_my_commands(commands)
     

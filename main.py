@@ -16,21 +16,22 @@ import kis_client
 import state_manager
 
 # 커맨드 이름 -> 핸들러 함수
+# 순서: 시작/도움말 -> 조회 -> 제어 -> 설정 -> 위험(초기화/청산). /help 텍스트의 분류와 동일하게 유지.
 COMMAND_HANDLERS = [
     ("start", telegram_bot.start),
     ("help", telegram_bot.cmd_help),
     ("status", telegram_bot.cmd_status),
-    ("sync", telegram_bot.cmd_sync),
-    ("manual_order", telegram_bot.cmd_manual_order),
     ("cash", telegram_bot.cmd_cash),
     ("report", telegram_bot.cmd_report),
-    ("profit_reset", telegram_bot.cmd_profit_reset),
     ("profit_history", telegram_bot.cmd_profit_history),
-    ("add_target", telegram_bot.cmd_add_target),
-    ("del_target", telegram_bot.cmd_del_target),
-    ("edit_target", telegram_bot.cmd_edit_target),
-    ("liquidate", telegram_bot.cmd_liquidate),
     ("logs", telegram_bot.cmd_logs),
+    ("sync", telegram_bot.cmd_sync),
+    ("manual_order", telegram_bot.cmd_manual_order),
+    ("add_target", telegram_bot.cmd_add_target),
+    ("edit_target", telegram_bot.cmd_edit_target),
+    ("del_target", telegram_bot.cmd_del_target),
+    ("profit_reset", telegram_bot.cmd_profit_reset),
+    ("liquidate", telegram_bot.cmd_liquidate),
 ]
 
 # 버튼 텍스트(Regex) -> 동일 기능 커맨드 핸들러
