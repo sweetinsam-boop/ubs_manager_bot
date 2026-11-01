@@ -1,0 +1,10 @@
+# Python 3.10+ 필요 (Dockerfile은 3.11 기준). 3.8 + 최신 pandas_market_calendars 는 타입 문법 오류가 난다.
+requests
+# v20+ 필수: Application, filters 등 (구버전은 Updater API)
+python-telegram-bot[job-queue]>=20.0,<23
+pytz
+yfinance
+pandas_market_calendars
+python-dateutil
+pandas
+python-dotenv==1.0.1

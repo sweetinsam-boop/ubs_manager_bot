@@ -1,5 +1,5 @@
 """
-공통 유틸: 거래 잠금, 채팅 ID, 누적 수익, 성과 로그, 사이클 상태, 리포트/정산일, 시장 세션, 뉴스, 포트 킬.
+공통 유틸: 거래 잠금, 채팅 ID, 누적 수익, 성과 로그, 사이클 상태, 리포트/정산일, 시장 세션.
 파일 경로 및 JSON/텍스트 I/O는 storage 모듈을 사용합니다.
 """
 from __future__ import annotations
@@ -16,7 +16,6 @@ from storage.paths import (
     CUMUL_PROFIT_FILE,
     PERFORMANCE_LOG_FILE,
     CYCLE_STATE_FILE,
-    LAST_REPORT_FILE,
     LAST_SETTLEMENT_DATE_FILE,
 )
 from storage.file_store import load_json, save_json, load_text, save_text
@@ -34,14 +33,10 @@ PERFORMANCE_LOG_FILE = str(get_path(PERFORMANCE_LOG_FILE))
 TRADE_LOCK_FILE = str(get_path(TRADE_LOCK_FILE))
 
 
-def save_last_report(report_text: str) -> None:
-    """최근 발송된 정산 리포트를 파일에 저장합니다."""
-    save_text(get_path(LAST_REPORT_FILE), report_text)
-
-
-def load_last_report():
-    """파일에 저장된 최근 정산 리포트를 불러옵니다."""
-    return load_text(get_path(LAST_REPORT_FILE))
+def load_performance_log() -> list:
+    """일별 계좌 자산·벤치마크 기록 [{date, equity, benchmark, nasdaq}]. 파일명은 .csv지만 내용은 JSON이다."""
+    data = load_json(get_path(PERFORMANCE_LOG_FILE), default=[])
+    return data if isinstance(data, list) else []
 
 
 def get_us_today() -> str:
@@ -138,7 +133,10 @@ def save_chat_id(chat_id: int) -> None:
 
 
 def load_chat_id():
-    """저장된 채팅 ID를 반환합니다. 없거나 오류 시 None."""
+    """명령을 받을 채팅 ID. .env의 TELEGRAM_CHAT_ID가 우선이고, 없으면 처음 /start 한 채팅. 없으면 None."""
+    env = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if env.lstrip("-").isdigit():
+        return int(env)
     raw = load_text(get_path(CHAT_ID_FILE))
     if raw is None:
         return None

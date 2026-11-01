@@ -1,1546 +1,643 @@
 """
-텔레그램 봇: 커맨드/콜백 핸들러 및 메뉴.
+텔레그램 봇: 커맨드/콜백 핸들러 및 메뉴 (무한매수법 V4.0 전용). 응답은 HTML parse_mode.
 콜백 액션은 CALLBACK_HANDLERS 매핑으로 디스패치합니다.
 """
 from __future__ import annotations
 
 import asyncio
-import math
-import os
+import html
 import io
+import re
 import traceback
-import datetime
+
 import pytz
 from dateutil import parser
-import pandas as pd
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand
-from telegram.constants import MessageEntityType
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+import guide_theory
 import kis_client
+import report_html
+import state_manager
 import strategy
 import utils
-import state_manager
-import guide_theory
-from state_manager import STRATEGY, CURRENT_CASH
 from bot_logging import get_logger, read_recent_log_text
 from notification_service import notifier
-from ui_formatter import UIFormatter
+from state_manager import STRATEGY
 from trade_service import TradeService
+from ui_formatter import UIFormatter, pre
 
 log = get_logger(__name__)
+_e = html.escape
+TG_SAFE = 3900
 
 
-def _v30_v40_hardcoded_profit(ticker: str):
-    """V3.0/V4.0 하드코딩 수익률: TQQQ=15%, SOXL=20%, 그 외=None(사용자 입력 필요)."""
-    t = ticker.upper()
-    if t == "TQQQ":
-        return 15.0
-    if t == "SOXL":
-        return 20.0
-    return None
+async def _send(event, text: str, reply_markup=None) -> None:
+    """메시지면 새로 답하고, 콜백 쿼리면 그 메시지를 수정한다."""
+    kw = {"parse_mode": "HTML", "reply_markup": reply_markup, "disable_web_page_preview": True}
+    if hasattr(event, "edit_message_text"):
+        await event.edit_message_text(text, **kw)
+    else:
+        await event.reply_text(text, **kw)
 
 
-def _runtime_strategy_entry(ticker: str, sv: dict, data=None) -> dict:
-    """trading_settings 종목 dict → STRATEGY 런타임 엔트리 (method·one_time_usd 유지 규칙 동일)."""
-    ot = sv.get("one_time_usd")
-    try:
-        one_time_usd = float(ot) if ot is not None and str(ot).strip() != "" else None
-    except (TypeError, ValueError):
-        one_time_usd = None
-    if data is None:
-        data = STRATEGY.get(ticker, {}).get("data", {"avg": 0.0, "qty": 0.0, "cumul": 0.0})
-    return {
-        "seed": float(sv["seed"]),
-        "total_a": float(sv["total_a"]),
-        "target_profit": float(sv["target_profit"]),
-        "method": state_manager.normalize_strategy_method(sv.get("method")),
-        "one_time_usd": one_time_usd,
-        "data": data,
-    }
-
-
-# 매뉴얼 가이드 타입별 설명 (guide 콜백용)
-GUIDE_TEXTS = {
-    "status": (
-        "🔍 **Status(현황보기) 딥다이브**\n\n"
-        "• **입력 유입**: KIS 실시간 API를 통해 종목별 평단가, 보유 수량, 현재 가격을 수집합니다.\n"
-        "• **내부 계산**: 사용자가 설정한 분할 횟수와 현재 평단을 대조하여 '별 포인트'와 '탈출 포인트'를 연산합니다.\n"
-        "• **교차 검증**: 이론값만 보여주는 것이 아니라, 증권사 서버의 '미체결 주문 리포트'를 직접 읽어와 실제 주문이 들어갔는지 0.1초 단위로 비교합니다.\n"
-        "• **결과물**: [현재 수익률], [이론상 매수/매도 계획], [실제 증권사 대기 주문]을 하나로 합친 통합 리포트를 제공합니다."
-    ),
-    "cash": (
-        "💰 **Cash & Report 딥다이브**\n\n"
-        "• **입력 유입**: 계좌 내 외화/원화 현고와 한국투자증권 고시 환율 정보를 가져옵니다.\n"
-        "• **내부 계산**: 환율을 적용하여 전체 자산을 '달러($)' 기준으로 통합 환산하고, `cumul_profit.json` 파일에 저장된 과거 익절 기록을 합산합니다.\n"
-        "• **결과물**: 실시간 가용 자산 현황과 지금까지 누적된 확정 수익금을 원화와 달러로 동시에 리포트합니다."
-    ),
-    "sync": (
-        "🔄 **Sync(계좌 동기화) 딥다이브**\n\n"
-        "• **입력 유입**: `trading_settings.json` 설정값과 증권사 잔고 데이터를 다시 읽어옵니다.\n"
-        "• **내부 계산**: 보유수량/평단/예수금을 최신화하고, 오늘의 매매 계획 계산이 정확해지도록 상태를 갱신합니다.\n"
-        "• **결과물**: 동기화 완료 메시지만 반환합니다. 주문 전송은 `/manual_order` 또는 자동 스케줄에 의해 수행됩니다."
-    ),
-    "manual_order": (
-        "🧾 **Manual Order(수동 주문) 딥다이브**\n\n"
-        "• **1단계**: 먼저 `/sync`와 동일하게 계좌 동기화를 수행합니다.\n"
-        "• **2단계**: 증권사 서버의 미체결 주문을 조회해 '이미 주문이 있는지'를 종목별로 보여줍니다.\n"
-        "• **3단계**: 사용자가 종목을 선택하면, 무한매수 방법론에 따른 '오늘의 LOC 주문'을 전송합니다.\n"
-        "• **주의**: 이미 오늘 주문을 넣은 종목에 추가 주문을 넣으면 과매수/중복 주문이 될 수 있어, 실행 전 현황을 반드시 확인해야 합니다."
-    ),
-    "setup": (
-        "📝 **Add & Edit(설정관리) 딥다이브**\n\n"
-        "• **입력 유입**: 사용자의 텍스트 명령어(티커, 시드, 횟수 등)를 파싱합니다.\n"
-        "• **내부 계산**: 입력받은 '전체 시드'를 '분할 횟수'로 나누어 1회 기본 매수금을 정하고, 목표 수익률에 따른 하락장 대응 로직(LIFO 매도 등)을 설정 파일에 반영합니다.\n"
-        "• **결과물**: 봇의 감시 목록에 해당 종목이 추가되며, 즉시 첫 번째 동기화 작업을 수행하여 감시 사이클을 가동합니다."
-    ),
-    "sell": (
-        "🚨 **Liquidate & 사이클 종료 딥다이브**\n\n"
-        "• **입력 유입**: 긴급 전량 매도 신호 또는 목표가 도달 신호를 받습니다.\n"
-        "• **내부 계산**: 일반적인 지정가가 아닌 'MOC(Market on Close - 장마감 시장가)' 주문을 활용하여 반드시 오늘 내로 체결되도록 신뢰도를 높입니다.\n"
-        "• **결과물**: 모든 물량이 청산되면 투자 사이클이 종료되었음을 알리고, 해당 기간의 S&P 500 상승분과 내 수익을 정밀 비교하는 '종합 성적표'를 발송합니다."
-    ),
-    "theory_22": guide_theory.THEORY_22,
-    "theory_30": guide_theory.THEORY_30,
-    "theory_40": guide_theory.THEORY_40,
-    "theory_compare": guide_theory.THEORY_COMPARE,
-}
-
-
-def _message_has_bot_command(message) -> bool:
-    if not message or not getattr(message, "text", None):
-        return False
-    for ent in message.entities or ():
-        if ent.type == MessageEntityType.BOT_COMMAND:
-            return True
-    return False
-
-
-def _build_cmd_cash_message():
-    """KIS 예수금·보유 조회(동기). 성공 시 (msg, None), 실패 시 (None, err_str)."""
-    try:
-        token = kis_client.get_kis_access_token()
-        usd_cash, cash_source = kis_client.query_available_cash(token)
-        data = kis_client.query_account_raw() or {}
-        rt_cd = data.get("rt_cd", "N/A")
-
-        msg = f"[예수금 조회]\n"
-        msg += f"달러 예수금: ${usd_cash:,.2f}\n"
-
-        krw_cash = kis_client.query_krw_cash(token)
-        msg += f"원화 예수금: ₩{int(krw_cash):,}원\n"
-
-        rate, ref_time_raw = kis_client.get_exchange_rate()
-
-        try:
-            dt_obj = parser.parse(ref_time_raw)
-            kst_str = dt_obj.strftime("%m-%d %H:%M")
-            ny_tz = pytz.timezone("America/New_York")
-            ny_str = dt_obj.astimezone(ny_tz).strftime("%m-%d %H:%M")
-            ref_time_display = f"{kst_str} KST / {ny_str} NY"
-        except Exception:
-            ref_time_display = ref_time_raw
-
-        msg += f"--------------------------\n"
-        msg += f"실시간 환율: {rate:,.2f}원 ({ref_time_display})\n"
-
-        holdings = data.get("output1", []) if rt_cd == "0" else []
-        all_stock_evl = 0.0
-        if holdings:
-            msg += "\n[보유 종목]\n"
-            for item in holdings:
-                sym = item.get("ovrs_pdno", "?").strip()
-                qty_str = item.get("ovrs_cblc_qty", "0")
-                avg = item.get("pchs_avg_pric", "0")
-                qty_f = float(qty_str)
-                avg_f = float(avg)
-                now_f = kis_client.get_current_price(sym)
-                pnl = now_f * qty_f - avg_f * qty_f
-                pnl_rt = ((now_f - avg_f) / avg_f * 100) if avg_f > 0 else 0.0
-                all_stock_evl += now_f * qty_f
-                in_strategy = " *" if sym in STRATEGY else ""
-                msg += f"  {sym}{in_strategy}: {qty_str}주 / 현재${now_f:,.2f} / 손익${pnl:,.2f}({pnl_rt:.1f}%)\n"
-
-        msg += f"\n현금: ${usd_cash:,.2f} / 주식: ${all_stock_evl:,.2f}\n"
-        return msg, None
-    except Exception as e:
-        return None, str(e)
-
-
-def _build_manual_order_summary_text():
-    summary = "[수동 주문] 현재 주문/잠금 현황 (미국 동부 당일 미체만)\n"
-    summary += "--------------------------\n"
-    locked_tickers = []
-    for ticker in STRATEGY:
-        locked = utils.check_trade_lock(ticker)
-        if locked:
-            locked_tickers.append(ticker)
-        unfilled = []
-        try:
-            unfilled = kis_client.query_unfilled_orders_today_us(ticker)
-        except Exception:
-            unfilled = []
-        try:
-            locked_by_broker = bool(unfilled)
-        except Exception:
-            locked_by_broker = False
-        if locked_by_broker and not locked:
-            locked = True
-            locked_tickers.append(ticker)
-            try:
-                utils.set_trade_lock(ticker)
-            except Exception:
-                pass
-        lock_tag = "LOCKED" if locked else "OPEN"
-        if unfilled:
-            active_cnt = sum(1 for u in unfilled if u.get("status") == "대기")
-            summary += f"• {ticker} [{lock_tag}]: 당일 미체결 {len(unfilled)}건 (대기 {active_cnt}건)\n"
-        else:
-            summary += f"• {ticker} [{lock_tag}]: 당일 미체결 없음\n"
-
-    if locked_tickers:
-        summary += "\n오늘 주문 전송됨(LOCKED) 종목: " + ", ".join(sorted(set(locked_tickers))) + "\n"
-        summary += "  └ (수동 주문은 가능하지만, 중복/과매수 위험이 있어 주의가 필요합니다.)\n"
-
-    summary += "\n주의(추가매수/추가주문)\n"
-    summary += "- 이미 오늘 주문을 전송한 종목에 대해 추가로 주문을 넣으면, 전략 의도와 다르게 과매수/중복 주문이 될 수 있습니다.\n"
-    summary += "- 반드시 /status에서 최근 주문·체결 내역을 확인한 뒤 진행하세요.\n"
-    return summary
+async def _send_long(message, text: str) -> None:
+    """긴 HTML 본문을 빈 줄 경계로 나눠 보낸다 (각 문단이 자체 완결된 태그여야 함)."""
+    t = text.strip()
+    while t:
+        if len(t) <= TG_SAFE:
+            await message.reply_text(t, parse_mode="HTML")
+            return
+        cut = t.rfind("\n\n", 0, TG_SAFE)
+        cut = cut if cut > TG_SAFE // 3 else TG_SAFE
+        await message.reply_text(t[:cut].strip(), parse_mode="HTML")
+        t = t[cut:].strip()
 
 
 def main_reply_keyboard_markup() -> ReplyKeyboardMarkup:
-    """상설 메뉴 키보드 (/start·알 수 없는 입력 안내 등에서 공통 사용)."""
     rows = [
-        ["📊 현황보기(/status)", "💰 예수금확인(/cash)"],
-        ["📈 수익보고(/report)"],
-        ["신규동기화(/sync)", "🧾 수동주문(/manual_order)"],
-        ["📚 도움말(/help)", "📋 수익기록(/profit_history)"],
+        ["현황 /status", "예수금 /cash"],
+        ["리포트 /report", "수익기록 /profit_history"],
+        ["동기화 /sync", "수동주문 /manual_order"],
+        ["도움말 /help"],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
+def _kb(*rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=cb) for t, cb in row] for row in rows])
+
+
+async def _active_unfilled(ticker: str) -> int:
+    try:
+        unfilled = await asyncio.to_thread(kis_client.query_unfilled_orders_today_us, ticker)
+        return sum(1 for u in unfilled if u.get("status") == "대기") if unfilled else 0
+    except Exception as e:
+        log.warning("미체결 확인 중 오류: %s", e)
+        return 0
+
+
+# ── 시작·도움말·조회 ─────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     utils.save_chat_id(chat_id)
-    
+
     from scheduler import register_schedules
     register_schedules(context.job_queue, chat_id)
-    
-    markup = main_reply_keyboard_markup()
-    
-    welcome_msg = (
-        "🚀 **무한매수봇 2.0 - 당신의 개인 투자 비서**\n\n"
-        "봇이 정상적으로 가동되었습니다! 설정하신 전략에 따라 매일 밤 자동으로 매매를 수행합니다.\n\n"
-        "⏰ **핵심 자동화 스케줄 (한국 시간 기준)**\n"
-        "• **22:35 / 23:35**: 정규장 오픈 및 일일 주문 전송\n"
-        "• **05:00 / 06:00**: 정규장 마감 알림\n"
-        "• **장 마감 후(미국 동부, `trading_settings.json`의 `POST_CLOSE_SYNC_NY`, 기본 16:40)**: 계좌 자동 동기화(`/sync`와 동일)\n"
-        "• **08:00 (화~토, KST)**: 종합 정산 리포트 및 수익 보고 (일·월 아침은 생략)\n\n"
-        "💡 아래 메뉴 버튼을 누르면 타이핑 없이 주요 기능을 즉시 실행할 수 있습니다. 자세한 사용법은 `/help`를 확인해주세요!\n"
-        "🛠 오류·스케줄 이상 시 서버 기록은 `/logs` (최근 24시간)로 확인할 수 있습니다."
+
+    from config_manager import get_post_close_sync_ny_time
+    h, m = get_post_close_sync_ny_time()
+    msg = (
+        "<b>무한매수법 V4.0 봇이 가동 중입니다.</b>\n\n"
+        "설정한 종목을 규칙대로 매일 자동 매매합니다. 하는 일은 다음과 같습니다.\n"
+        "- 뉴욕 09:35 (한국 22:35 또는 23:35): 정규장 주문 전송\n"
+        f"- 뉴욕 {h:02d}:{m:02d}: 계좌 동기화와 체결 정산(T, 잔금 갱신)\n"
+        "- 한국 08:00 (화~토): 전일 매매 리포트와 HTML 리포트\n\n"
+        "아래 버튼으로 주요 기능을 바로 쓸 수 있고, 자세한 설명은 /help 에 있습니다. "
+        "오류가 의심되면 /logs 로 최근 24시간 기록을 볼 수 있습니다."
     )
-    await update.message.reply_text(welcome_msg, reply_markup=markup)
+    if not STRATEGY:
+        msg += "\n\n등록된 종목이 없습니다. <code>/add_target TQQQ 8000 20</code> 처럼 추가하세요 (종목, 원금, 분할 수)."
+    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=main_reply_keyboard_markup())
+
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Telegram Markdown은 '_' 등에서 엔티티 파싱 오류가 잦아 help는 HTML로 고정합니다.
-    help_text = (
-        "📚 <b>[무한매수봇 도움말]</b>\n\n"
-        "<b>핵심 흐름</b>\n"
-        "- <b>자동 운용</b>: 매일 정규장 오픈 시점에 전략에 따른 주문(LOC 중심)을 자동 전송하고, 다음날 아침 리포트로 체결을 요약합니다.\n"
-        "- <b>동기화</b>(<code>/sync</code>): 내 계좌의 <b>잔고/평단/현금</b>을 봇 상태와 맞춥니다. (입금/설정변경 후 권장)\n"
-        "- <b>수동주문</b>(<code>/manual_order</code>): 먼저 <b>이미 들어간 주문/미체결 여부</b>를 보여준 뒤, 종목을 선택해 <b>오늘의 LOC 주문</b>을 넣습니다.\n\n"
-        "<b>투자 사이클 예시</b>\n"
-        "- Day 1: <code>/add_target</code>로 종목 추가 → 자동/수동주문으로 첫 진입\n"
-        "- Day N: 하락 시 분할 매수로 평단 조정 (전략 파라미터 기반)\n"
-        "- Day M: 목표 수익률 도달 시 전량 익절 매도 → 사이클 종료 보고\n\n"
-        "<b>명령어</b>\n"
-        "- <b>조회</b>: <code>/status</code>(현황+최근 주문·체결), <code>/cash</code>(예수금/보유), <code>/report</code>(누적 수익), <code>/profit_history</code>(익절 기록), <code>/logs</code>(최근 24시간 서버 로그)\n"
-        "- <b>제어</b>: <code>/sync</code>(계좌 동기화), <code>/manual_order</code>(수동 주문)\n"
-        "- <b>설정</b>: <code>/add_target</code>(추가), <code>/edit_target</code>(수정), <code>/del_target</code>(삭제)\n"
-        "- <b>긴급</b>: <code>/liquidate</code>(전량 매도 및 종료)\n\n"
-        "<b>무한매수법 3.0</b>\n"
-        "- <code>/add_target 티커 시드 분할 목표% 3.0</code> 처럼 마지막에 <code>3.0</code>을 주면 해당 종목만 V3.0 규칙(별%/쿼터, LOC 매도=별%가 등)을 씁니다. 생략 시 2.2.\n"
-        "- 1회 매수금을 시드÷분할이 아니라 고정 달러로 쓰려면 <code>trading_settings.json</code>의 해당 종목에 <code>one_time_usd</code>를 넣으세요.\n"
-        "- <b>V3.0 T·회차</b>: 실매수 누적 USD(<code>v3_buy_state.json</code>)÷1회 기준입니다. <b>2.2</b>는 잔고(평단×수량)÷1회 근사입니다.\n\n"
-        "<b>무한매수법 4.0</b>\n"
-        "- 마지막 인자에 <code>4.0</code>: 일반모드(잔금÷(N-T) 1회매수, 별지점 매수-0.01/매도, 쿼터·매수·리버스 T 갱신은 <b>체결 누적</b> 기준) 및 소진 후 리버스(첫날 MOC 분할, 이후 5일종가 별지점).\n"
-        "- T는 <code>v4_strategy_state.json</code>에 저장됩니다(최초는 잔고 기반 추정). MOC 등 장 마감 체결은 pending 후 <code>/sync</code>에서 재확인합니다.\n\n"
-        "💡 아래 버튼에서 기능 원리·<b>버전별 이론(상세)</b>·<b>버전 비교·시장별 성향</b>을 볼 수 있습니다."
+    text = (
+        "<b>무한매수봇 도움말</b>\n\n"
+        "<b>조회</b>\n"
+        "/status 현황과 오늘 계획, /report HTML 리포트, /cash 예수금, /profit_history 익절 기록, /logs 최근 24시간 로그\n\n"
+        "<b>제어</b>\n"
+        "/sync 계좌 동기화와 체결 정산, /manual_order 오늘 주문을 수동으로 전송, /set_t 진행도 T 보정\n\n"
+        "<b>설정</b>\n"
+        "/add_target 종목 원금 분할수 [수익%] 추가\n"
+        "/edit_target 종목 원금 분할수 [수익%] 수정\n"
+        "/del_target 감시 중단 (주식은 팔지 않음)\n\n"
+        "<b>긴급</b>\n"
+        "/liquidate 전량 매도 후 종료, /profit_reset 누적 수익 기록 초기화\n\n"
+        "<b>자주 하는 일</b>\n"
+        "- 증권사 앱에서 직접 매매했거나 입금했다면 /sync 후 /status 로 확인합니다.\n"
+        "- T가 증권사 앱·카페 엑셀의 진행과 다르면 <code>/set_t TQQQ 7.5</code> 처럼 맞춥니다. 값을 생략하면 보유 원가로 다시 추정합니다.\n\n"
+        "아래 버튼에서 기능 원리와 V4.0 이론을 볼 수 있습니다."
     )
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=_kb(
+        [("현황 원리", "guide:status"), ("주문과 정산 원리", "guide:orders")],
+        [("V4.0 이론", "guide:theory_40")],
+    ))
 
-    keyboard = [
-        [InlineKeyboardButton("📊 Status 원리", callback_data="guide:status"),
-         InlineKeyboardButton("💰 Cash/Report 원리", callback_data="guide:cash")],
-        [InlineKeyboardButton("🔄 Sync 원리", callback_data="guide:sync"),
-         InlineKeyboardButton("🧾 Manual Order 원리", callback_data="guide:manual_order")],
-        [InlineKeyboardButton("📝 설정/추가 원리", callback_data="guide:setup"),
-         InlineKeyboardButton("🚨 특별매도 원리", callback_data="guide:sell")],
-        [
-            InlineKeyboardButton("이론V2.2", callback_data="guide:theory_22"),
-            InlineKeyboardButton("이론V3.0", callback_data="guide:theory_30"),
-            InlineKeyboardButton("이론V4.0", callback_data="guide:theory_40"),
-        ],
-        [InlineKeyboardButton("버전 비교·시장별 유리", callback_data="guide:theory_compare")],
-    ]
-    await update.message.reply_text(help_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+GUIDE_TEXTS = {
+    "status": (
+        "<b>현황 원리</b>\n\n"
+        "증권사에서 잔고와 시세를 읽고, 봇이 저장한 T와 잔금으로 오늘의 별지점, 목표가, 주문 계획을 계산해 보여줍니다. "
+        "조회만 하며 주문이나 상태 변경은 일어나지 않습니다. 종목 버튼을 누르면 그 종목의 상세 지시서를 볼 수 있습니다."
+    ),
+    "orders": (
+        "<b>주문과 정산 원리</b>\n\n"
+        "1. 뉴욕 09:35에 오늘 주문(LOC, 지정가, MOC)을 전송하고 주문번호를 저장합니다.\n"
+        "2. 장 마감 후 그 주문번호의 체결 내역을 읽습니다.\n"
+        "3. 체결 결과에 따라 T와 잔금을 갱신합니다 (매수 +1 또는 +0.5, 쿼터매도 ×0.75 등).\n"
+        "정산은 같은 주문을 두 번 반영하지 않고, 증권사 조회가 실패하면 다음 기회로 미룹니다."
+    ),
+    "theory_40": guide_theory.THEORY_40,
+}
+
+
+async def _cb_guide(update, context, query, parts):
+    content = GUIDE_TEXTS.get(parts[1], "")
+    if content:
+        await _send_long(query.message, content)
+    else:
+        await query.message.reply_text("해당 가이드가 없습니다.")
 
 
 async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """등록 채팅 전용. 최근 24시간(KST) 로그 — 서버에는 30일 롤링 저장."""
-    cid = utils.load_chat_id()
-    if not cid:
-        await update.message.reply_text("먼저 /start 로 이 채팅을 등록한 뒤 /logs 를 사용할 수 있습니다.")
-        return
-    if update.effective_chat.id != cid:
-        await update.message.reply_text("이 명령은 봇에 등록된 채팅에서만 사용할 수 있습니다.")
-        return
-
-    await update.message.reply_text("최근 24시간 로그를 불러오는 중…")
+    await update.message.reply_text("최근 24시간 로그를 불러오는 중입니다.")
     preview, prev_trunc = read_recent_log_text(hours=24, max_total_chars=3500)
     full, full_trunc = read_recent_log_text(hours=24, max_total_chars=400_000)
-
-    head = (
-        "최근 24시간 로그 (KST)\n"
-        "서버: logs/bot.log · 자정마다 회전 · 최대 30일 보관\n"
-        + "━" * 22
-        + "\n\n"
-    )
-    text = head + preview
+    text = "최근 24시간 로그 (KST)\n서버: logs/bot.log, 30일 보관\n" + "─" * 20 + "\n\n" + preview
     if prev_trunc:
         text += "\n\n(미리보기는 뒷부분 위주입니다. 파일에 전체가 담깁니다.)"
     await update.message.reply_text(text)
-
     if len(full) > 3200 or prev_trunc or full_trunc:
         bio = io.BytesIO(full.encode("utf-8"))
-        bio.name = "ubs_bot_log_24h.txt"
-        cap = "최근 24시간 로그 전문"
-        if full_trunc:
-            cap += " (40만자 초과분 제외)"
-        await update.message.reply_document(document=bio, caption=cap)
+        bio.name = "bot_log_24h.txt"
+        await update.message.reply_document(document=bio, caption="최근 24시간 로그 전문")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("실시간 시세 및 실제 주문 내역을 조회 중입니다...")
-    
-    from scheduler import generate_combined_report
-    msg = await generate_combined_report(is_full=False)
-    
-    keyboard = []
-    for ticker in STRATEGY:
-        keyboard.append([InlineKeyboardButton(f"[상세 지시서] {ticker}", callback_data=f"status_dive:{ticker}")])
-        
-    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("시세와 주문 내역을 조회하는 중입니다.")
+    data = await asyncio.to_thread(TradeService.get_portfolio_summary)
+    rows = [[(f"{t} 지시서", f"status_dive:{t}") for t in STRATEGY]] if STRATEGY else []
+    rows.append([("HTML 리포트 받기", "html_report")])
+    await update.message.reply_text(UIFormatter.daily_report(data), parse_mode="HTML", reply_markup=_kb(*rows))
+
+
+def _build_cash_message():
+    """KIS 예수금·보유 조회(동기). 성공 시 (msg, None), 실패 시 (None, err)."""
+    try:
+        token = kis_client.get_kis_access_token()
+        usd_cash, _src = kis_client.query_available_cash(token)
+        data = kis_client.query_account_raw() or {}
+        lines = ["[예수금 조회]", f"달러 예수금: ${usd_cash:,.2f}",
+                 f"원화 예수금: ₩{int(kis_client.query_krw_cash(token)):,}"]
+        rate, ref_raw = kis_client.get_exchange_rate()
+        try:
+            dt = parser.parse(ref_raw)
+            ref = f"{dt.strftime('%m-%d %H:%M')} KST / {dt.astimezone(pytz.timezone('America/New_York')).strftime('%m-%d %H:%M')} NY"
+        except Exception:
+            ref = ref_raw
+        lines += ["─" * 20, f"환율: {rate:,.2f}원 ({ref})"]
+
+        stock_total = 0.0
+        holdings = data.get("output1", []) if data.get("rt_cd") == "0" else []
+        if holdings:
+            lines.append("\n[보유 종목] (* 봇 운용 종목)")
+            for item in holdings:
+                sym = item.get("ovrs_pdno", "?").strip()
+                qty, avg = float(item.get("ovrs_cblc_qty", "0")), float(item.get("pchs_avg_pric", "0"))
+                now = kis_client.get_current_price(sym)
+                stock_total += now * qty
+                rt = (now - avg) / avg * 100 if avg > 0 else 0.0
+                mark = " *" if sym in STRATEGY else ""
+                lines.append(f"  {sym}{mark}: {qty:g}주, 현재 ${now:,.2f}, 손익 ${(now - avg) * qty:,.2f} ({rt:.1f}%)")
+        lines.append(f"\n현금 ${usd_cash:,.2f} / 주식 ${stock_total:,.2f}")
+        return "\n".join(lines), None
+    except Exception as e:
+        return None, str(e)
+
 
 async def cmd_cash(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text("주문가능금액 조회 중...")
-    msg, err = await asyncio.to_thread(_build_cmd_cash_message)
-    if err:
-        await update.message.reply_text(f"조회 오류: {err}")
-        return
-    await update.message.reply_text(msg)
-
-async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg_wait = await update.message.reply_text("계좌 정보를 최신화하는 중입니다... (잔고, 평단가, 예수금을 동기화합니다.)")
-    pre_avgs = await asyncio.to_thread(TradeService.capture_pre_sync_avgs)
-    success, res_msg = await asyncio.to_thread(state_manager.sync_account)
-    if not success:
-        await msg_wait.edit_text(f"[동기화 실패] {res_msg}")
-        return
-
-    sync_done = (
-        "[동기화 완료] 모든 종목의 최신 정보가 반영되었습니다.\n\n"
-        "오늘의 LOC 주문을 수동으로 넣으려면 /manual_order를 실행해 주세요.\n"
-        "(먼저 현재 주문/미체결을 보여주고, 그 다음 종목 선택 -> 주문 전송 순서로 진행합니다.)"
-    )
-    await msg_wait.edit_text(sync_done)
-
-    if pre_avgs:
-        try:
-            profit_msgs = await asyncio.to_thread(
-                TradeService.reconcile_daily_sell_profits, pre_avgs
-            )
-            if profit_msgs:
-                await update.message.reply_text(
-                    "[동기화·매도실현 보정]\n\n" + "\n".join(profit_msgs)
-                )
-        except Exception as e:
-            log.warning("cmd_sync reconcile failed: %s", e, exc_info=True)
+    await update.message.reply_text("예수금을 조회하는 중입니다.")
+    msg, err = await asyncio.to_thread(_build_cash_message)
+    await update.message.reply_text(msg if not err else f"조회 오류: {err}")
 
 
-async def cmd_manual_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    수동 주문 플로우:
-    1) 동기화(잔고/평단/현금) 수행
-    2) 현재 미체결 주문 및 잠금 상태를 보여줌
-    3) 사용자가 종목을 선택하면 무한매수 방법론에 따른 '오늘의 LOC 주문' 전송
-       - (주의) 기존에는 reset으로 잠금을 해제했으나, 이제는 manual_order에서 안내 후 수동 주문을 허용합니다.
-    """
-    msg_wait = await update.message.reply_text(
-        "수동 주문 준비 중...\n(1/2) 계좌 동기화 및 주문 상태를 확인합니다.",
-    )
-    success, res_msg = await asyncio.to_thread(state_manager.sync_account)
-    if not success:
-        await msg_wait.edit_text(f"[동기화 실패] {res_msg}")
-        return
-
-    summary = await asyncio.to_thread(_build_manual_order_summary_text)
-    await msg_wait.edit_text(summary)
-
-    # 2) 종목 선택 버튼 (기존 콜백 주문 로직 재사용)
-    all_infos = {}
-    for ticker in STRATEGY:
-        all_infos[ticker] = strategy.build_order_info(ticker)
-
-    keyboard = []
-    for ticker, info in all_infos.items():
-        # (선택 전 검증 강화) 미체결 상세 보기 버튼 제공
-        keyboard.append(
-            [
-                InlineKeyboardButton(f"🔎 {ticker} 미체결 상세", callback_data=f"m_unfilled:{ticker}"),
-            ]
-        )
-        if info["qty_total"] == 0:
-            if info.get("b1", 0) > 0:
-                cb = f"m_entryask:{ticker}"
-                keyboard.append([InlineKeyboardButton(
-                    f"🚀 {ticker} 새 사이클 LOC 진입 ({info['b1']}주 @ ${info['avg_price']:.2f})",
-                    callback_data=cb,
-                )])
-            else:
-                try:
-                    _excg = kis_client.get_price_exchange_code(ticker)
-                except Exception:
-                    _excg = "?"
-                keyboard.append([InlineKeyboardButton(
-                    f"⚠️ {ticker} 시세조회 실패 (EXCD={_excg}) - 진입 불가", callback_data="noop"
-                )])
-        else:
-            keyboard.append(
-                [InlineKeyboardButton(f"🏦 {ticker} 오늘 LOC 매매 주문", callback_data=f"m_all:{ticker}")]
-            )
-
-    await update.message.reply_text(
-        "(2/2) 먼저 미체결 상세를 확인한 뒤, 주문할 종목을 선택하세요.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+async def _send_html_report(message) -> None:
+    path = await asyncio.to_thread(report_html.render_current)
+    cp = utils.aggregate_cumul_profit_by_ticker(utils.load_cumul_profit())
+    total = sum(cp.values())
+    caption = f"무한매수 운용 리포트. 누적 실현수익 ${total:,.2f}. 파일을 열어 브라우저로 보세요."
+    with open(path, "rb") as f:
+        await message.reply_document(document=f, filename=path.name, caption=caption)
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cp = utils.load_cumul_profit()
-    by_t = utils.aggregate_cumul_profit_by_ticker(cp)
-
-    rows: list[tuple[str, float]] = []
-    seen: set[str] = set()
-    for t in STRATEGY:
-        tu = str(t).strip().upper()
-        rows.append((tu, float(by_t.get(tu, 0.0))))
-        seen.add(tu)
-    for tu in sorted(by_t.keys()):
-        if tu not in seen:
-            rows.append((tu, float(by_t[tu])))
-            seen.add(tu)
-
-    msg = "[무한매수 실현수익 보고서]\n"
-    total = 0.0
-    for ticker, profit in rows:
-        msg += f"  {ticker} 누적: ${profit:,.2f}\n"
-        total += profit
-
-    msg += "  ------------------\n"
-    msg += f"  총 합계: ${total:,.2f}\n"
-    await update.message.reply_text(msg)
+    await update.message.reply_text("리포트를 만드는 중입니다.")
+    await _send_html_report(update.message)
 
 
-async def cmd_profit_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    utils.save_cumul_profit({"history": [], "processed_orders": []})
-    await update.message.reply_text("누적 익절 수익 기록이 초기화되었습니다.")
+async def _cb_html_report(update, context, query, parts):
+    await query.message.reply_text("리포트를 만드는 중입니다.")
+    await _send_html_report(query.message)
 
-async def cmd_profit_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cp = utils.load_cumul_profit()
-    history = [h for h in (cp.get("history") or []) if isinstance(h, dict)]
-    by_ticker = utils.aggregate_cumul_profit_by_ticker(cp)
 
-    if not history:
-        if any(abs(v) > 1e-9 for v in by_ticker.values()):
-            lines = "\n".join(f"💰 {t}: ${v:,.2f}" for t, v in sorted(by_ticker.items()) if abs(v) > 1e-9)
-            await update.message.reply_text(
-                "📋 건별 익절 이력(history)은 없습니다.\n\n"
-                f"다만 cumul_profit.json에 종목별 누적만 있는 상태입니다:\n\n{lines}\n\n"
-                "· /report와 동일한 숫자입니다.\n"
-                "· 이후 봇이 목표가 익절 체결을 기록하면 여기에 날짜·건당 내역이 쌓입니다.\n"
-                "· 예전에 정규장 익절만 하고 기록 로직이 없던 때의 잔여일 수 있습니다."
-            )
-            return
-        await update.message.reply_text(
-            "📋 현재 기록된 실현 수익이 없습니다.\n\n"
-            "목표가에 도달한 봇 익절 매도 가 체결 확인되면 history에 자동으로 쌓입니다. 첫 익절을 응원합니다! 🚀"
-        )
+async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wait = await update.message.reply_text("계좌 정보를 최신화하는 중입니다.")
+    pre_avgs = await asyncio.to_thread(TradeService.capture_pre_sync_avgs)
+    ok, res = await asyncio.to_thread(state_manager.sync_account)
+    if not ok:
+        await wait.edit_text(f"[동기화 실패] {res}")
         return
-
-    totals: dict[str, float] = {}
-    for h in history:
-        tx = str(h.get("ticker") or "").strip().upper()
-        if not tx:
-            continue
-        try:
-            totals[tx] = totals.get(tx, 0.0) + float(h.get("profit") or 0)
-        except (TypeError, ValueError):
-            continue
-
-    total_str = "\n".join(f"💰 {tx}: ${v:,.2f}" for tx, v in sorted(totals.items()))
-    msg = (
-        "📋 무한매수 실현 수익 요약 (history 기준)\n\n"
-        f"{total_str}\n\n"
-        "--- 최근 5건 (날짜 | 티커 | 버전 | 손익) ---\n"
-    )
-    for h in history[-5:]:
-        vlab = strategy.format_method_display(h.get("method"))
-        d = h.get("date", "?")
-        tic = str(h.get("ticker") or "?").strip().upper()
-        try:
-            val_p = float(h.get("profit") or 0)
-        except (TypeError, ValueError):
-            val_p = 0.0
-        msg += f"✅ {d} | {tic} | {vlab} | **${val_p:+,.2f}**\n"
-
-    keyboard = [[InlineKeyboardButton("🔍 전체 수익 기록 상세보기 (Deep-Dive)", callback_data="profit_dive")]]
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    lines = [f"[동기화 완료] {res}"]
+    try:
+        lines += await asyncio.to_thread(TradeService.settle_fills)
+        if pre_avgs:
+            lines += await asyncio.to_thread(TradeService.reconcile_daily_sell_profits, pre_avgs)
+    except Exception as e:
+        log.warning("cmd_sync settle failed: %s", e, exc_info=True)
+        lines.append(f"체결 정산 중 오류: {e}")
+    await wait.edit_text("\n".join(lines))
 
 
-
-async def cmd_add_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_set_t(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
-    if len(args) < 3:
-        msg = (
-            "➕ **종목 추가(Add Target) 가이드**\n\n"
-            "인자 없이 호출하면 이 안내만 표시됩니다. "
-            "RSI·차트는 증권사 앱/MTS나 별도 시세 도구에서 확인하세요.\n\n"
-            "**[참고] 흔히 쓰는 3배 레버리지 예시 티커**\n"
-            "`TQQQ` `UPRO` `SOXL` `TECL` `LABU` `NAIL` `DPST` … (투자 판단은 본인 책임)\n\n"
-            "**[방법론별 기본 익절목표 안내]**\n"
-            "• V2.2: 사용자 입력 적용 (기본 10%)\n"
-            "• V3.0·V4.0: TQQQ 15%, SOXL 20% (수익률 생략 가능)\n\n"
-            "**[사용법]**\n"
-            "1. 전량 입력: `/add_target 티커 시드 횟수 수익% 버전`\n"
-            "2. 수익 생략(TQQQ/SOXL): `/add_target 티커 시드 횟수 버전` (자동 15/20%)\n"
-            "3. 버전 생략: `/add_target 티커 시드 횟수 수익%` (V2.2)\n"
-            "4. 모두 생략: `/add_target 티커 시드 횟수` (10% / V2.2)\n\n"
-            "예: `/add_target TQQQ 3000 20 4.0` (V4.0, 15% 자동)"
-        )
-        await update.message.reply_text(msg, parse_mode="Markdown")
+    if not args or args[0].upper() not in STRATEGY:
+        await update.message.reply_text(
+            "사용법: /set_t 종목 [T값]\n예: /set_t TQQQ 7.5\n값을 생략하면 보유 원가로 T를 다시 추정합니다.\n"
+            "등록 종목: " + ", ".join(STRATEGY))
         return
-    
     ticker = args[0].upper()
     try:
-        seed = float(args[1])
-        total_a = float(args[2])
-    except (IndexError, ValueError):
-        await update.message.reply_text("❌ 시드와 분할횟수는 숫자여야 합니다.")
+        t_value = float(args[1]) if len(args) > 1 else None
+    except ValueError:
+        await update.message.reply_text("T값은 숫자로 입력하세요. 예: /set_t TQQQ 7.5")
+        return
+    if t_value is not None and not 0 <= t_value <= STRATEGY[ticker]["total_a"] + 5:
+        await update.message.reply_text("T값 범위가 올바르지 않습니다.")
+        return
+    await asyncio.to_thread(state_manager.sync_account)
+    t, pool = await asyncio.to_thread(strategy.recalibrate, ticker, t_value)
+    await update.message.reply_text(
+        f"{ticker} 진행도를 보정했습니다.\nT {t:.2f} / {STRATEGY[ticker]['total_a']:g}, 잔금 ${pool:,.2f} (원금 - 보유 원가)")
+
+
+# ── 수동 주문 ────────────────────────────────────────────────────
+
+async def cmd_manual_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wait = await update.message.reply_text("수동 주문 준비 중입니다. 계좌를 동기화하고 주문 상태를 확인합니다.")
+    ok, res = await asyncio.to_thread(state_manager.sync_account)
+    if not ok:
+        await wait.edit_text(f"[동기화 실패] {res}")
+        return
+    if not STRATEGY:
+        await wait.edit_text("등록된 종목이 없습니다. /add_target 으로 추가하세요.")
         return
 
-    # 지능적 인자 파싱 (add_target)
-    target_p = 10.0
-    method = "2.2"
-
-    if len(args) == 4:
-        val = args[3]
-        if val.lower() in ("3.0", "3", "v3", "v3.0", "4.0", "4", "v4", "v4.0"):
-            method = state_manager.normalize_strategy_method(val)
-            if ticker == "TQQQ": target_p = 15.0
-            elif ticker == "SOXL": target_p = 20.0
-        else:
-            try:
-                target_p = float(val)
-            except ValueError:
-                pass
-    elif len(args) >= 5:
-        try:
-            target_p = float(args[3])
-        except ValueError:
-            pass
-        method = state_manager.normalize_strategy_method(args[4])
-        # V3.0/V4.0: TQQQ/SOXL은 하드코딩 수익률 자동 적용 (사용자 입력 무시)
-        if method in ("3.0", "4.0"):
-            hp = _v30_v40_hardcoded_profit(ticker)
-            if hp is not None:
-                target_p = hp
-    else:
-        if ticker == "TQQQ": target_p = 15.0
-        elif ticker == "SOXL": target_p = 20.0
-
-    from config_manager import STRATEGY_SETTINGS, save_config
-    new_settings = dict(STRATEGY_SETTINGS)
-    prev = STRATEGY_SETTINGS.get(ticker, {})
-    entry = {**prev, "seed": seed, "total_a": total_a, "target_profit": target_p, "method": method}
-    new_settings[ticker] = entry
-
-    if save_config({"STRATEGY_SETTINGS": new_settings}):
-        STRATEGY[ticker] = _runtime_strategy_entry(ticker, entry)
-        m = STRATEGY[ticker]["method"]
-        effective_note = ""
-        if m in ("3.0", "4.0"):
-            if ticker == "TQQQ":
-                effective_note = f"\n⚠️ V{m} 적용: TQQQ 익절목표는 15%(고정)로 운용됩니다."
-            elif ticker == "SOXL":
-                effective_note = f"\n⚠️ V{m} 적용: SOXL 익절목표는 20%(고정)로 운용됩니다."
-        
-        await update.message.reply_text(
-            f"✅ {ticker} 설정 완료!\n- 시드: ${seed}\n- 횟수: {total_a}회\n- 목표: {target_p}%\n- 방식: {m}{effective_note}"
-        )
-    else:
-        await update.message.reply_text("❌ 설정 저장 실패")
-
-async def cmd_edit_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) < 3 and len(args) != 0:
-        await update.message.reply_text("❌ 사용법: `/edit_target 티커 시드 횟수 [수익%] [버젼]`")
-        return
-
-    if len(args) == 0:
-        from state_manager import STRATEGY
-        if not STRATEGY:
-            await update.message.reply_text("현재 투자 중인 종목이 없습니다.")
-            return
-
-        msg = (
-            "📝 <b>수정할 종목을 선택하세요</b>\n\n"
-            "선택 후에는 단계별로 값을 입력합니다. (시드 → 분할횟수 → 목표수익률)\n"
-            "또는 한 줄로도 입력할 수 있습니다.\n"
-            "<code>시드 분할횟수 [수익%] [버전]</code>\n\n"
-            "<b>[방법론별 기본 익절목표 참고]</b>\n"
-            "• V2.2: 사용자 입력 적용 (기본 10%)\n"
-            "• V3.0·V4.0: TQQQ 15%, SOXL 20% (수익률 생략 가능)\n\n"
-            "취소하려면 <code>취소</code> 라고 입력하세요."
-        )
-        keyboard = []
-        for t in STRATEGY.keys():
-            keyboard.append([InlineKeyboardButton(f"📝 {t} 수정", callback_data=f"edit_pick:{t}")])
-        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-    
-    ticker = args[0].upper()
-    from state_manager import STRATEGY
-    if ticker not in STRATEGY:
-        await update.message.reply_text(f"❌ {ticker} 종목은 현재 투자 대상이 아닙니다.")
-        return
-        
-    try:
-        seed = float(args[1])
-        total_a = float(args[2])
-    except (IndexError, ValueError):
-        await update.message.reply_text("❌ 시드와 분할횟수는 숫자여야 합니다.")
-        return
-
-    # 지능적 인자 파싱 (edit_target)
-    target_p = STRATEGY[ticker].get("target_profit", 10.0)
-    method = STRATEGY[ticker].get("method", "2.2")
-
-    if len(args) == 4:
-        val = args[3]
-        if val.lower() in ("3.0", "3", "v3", "v3.0", "4.0", "4", "v4", "v4.0"):
-            method = state_manager.normalize_strategy_method(val)
-            if ticker == "TQQQ": target_p = 15.0
-            elif ticker == "SOXL": target_p = 20.0
-        else:
-            try:
-                target_p = float(val)
-            except ValueError:
-                pass
-    elif len(args) >= 5:
-        try:
-            target_p = float(args[3])
-        except ValueError:
-            pass
-        method = state_manager.normalize_strategy_method(args[4])
-        # V3.0/V4.0: TQQQ/SOXL은 하드코딩 수익률 자동 적용 (사용자 입력 무시)
-        if method in ("3.0", "4.0"):
-            hp = _v30_v40_hardcoded_profit(ticker)
-            if hp is not None:
-                target_p = hp
-
-    from config_manager import STRATEGY_SETTINGS, save_config
-    new_settings = dict(STRATEGY_SETTINGS)
-    merged = {**STRATEGY_SETTINGS.get(ticker, {}), "seed": seed, "total_a": total_a, "target_profit": target_p, "method": method}
-    new_settings[ticker] = merged
-
-    if save_config({"STRATEGY_SETTINGS": new_settings}):
-        STRATEGY[ticker] = _runtime_strategy_entry(ticker, merged)
-        m = STRATEGY[ticker]["method"]
-        effective_note = ""
-        if m in ("3.0", "4.0"):
-            if ticker == "TQQQ":
-                effective_note = f"\n⚠️ V{m} 적용: TQQQ 익절목표는 15%(고정)로 운용됩니다."
-            elif ticker == "SOXL":
-                effective_note = f"\n⚠️ V{m} 적용: SOXL 익절목표는 20%(고정)로 운용됩니다."
-        
-        await update.message.reply_text(
-            f"✅ {ticker} 설정 변경 완료!\n- 시드: ${seed:,.0f}\n- 분할횟수: {total_a}회\n- 목표수익률: {target_p}%\n- 방식: {m}{effective_note}"
-        )
-    else:
-        await update.message.reply_text("❌ 설정 저장 실패")
-
-async def cmd_del_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from config_manager import STRATEGY_SETTINGS
-    args = context.args
-    
-    if not args:
-        if not STRATEGY_SETTINGS:
-            await update.message.reply_text("현재 등록된 종목이 없습니다.")
-            return
-            
-        keyboard = []
-        for ticker in STRATEGY_SETTINGS:
-            keyboard.append([InlineKeyboardButton(f"🗑️ {ticker} 삭제", callback_data=f"ask_del:{ticker}")])
-            
-        markup = InlineKeyboardMarkup(keyboard)
-        msg = (
-            "🗑️ **삭제할 종목을 선택하세요**\n\n"
-            "**주의사항:**\n"
-            "- 이 작업은 봇의 **감시 목록에서 해당 종목을 제외**합니다.\n"
-            "- 실제 증권 계좌에 있는 **주식은 매도되지 않습니다.**\n"
-            "- 봇이 더 이상 해당 종목을 관리하지 않게 됩니다."
-        )
-        await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=markup)
-        return
-    
-    ticker = args[0].upper()
-    await _execute_del_target(update, ticker)
-
-async def _execute_del_target(event, ticker):
-    from config_manager import STRATEGY_SETTINGS, save_config
-    if ticker not in STRATEGY_SETTINGS:
-        msg = f"대상 {ticker}를 찾을 수 없습니다."
-        if hasattr(event, 'reply_text'): await event.reply_text(msg)
-        else: await event.edit_message_text(msg)
-        return
-    
-    new_settings = dict(STRATEGY_SETTINGS)
-    del new_settings[ticker]
-    
-    if save_config({"STRATEGY_SETTINGS": new_settings}):
-        from state_manager import STRATEGY
-        if ticker in STRATEGY: del STRATEGY[ticker]
-        
-        # 모든 상태 파일 정리 (cumul_profit history 보존 포함)
-        utils.delete_ticker_from_all_states(ticker)
-        
-        msg = f"🗑️ **{ticker} 삭제 완료!**\n\n이제 봇이 {ticker} 종목을 더 이상 감시하거나 매매하지 않습니다."
-        if hasattr(event, 'reply_text'): await event.reply_text(msg, parse_mode='Markdown')
-        else: await event.edit_message_text(msg, parse_mode='Markdown')
-    else:
-        msg = "❌ 설정 저장 실패"
-        if hasattr(event, 'reply_text'): await event.reply_text(msg)
-        else: await event.edit_message_text(msg)
+    lines = ["<b>수동 주문 현황</b> (미국 동부 당일 기준)"]
+    rows = []
+    for ticker in STRATEGY:
+        locked = utils.check_trade_lock(ticker)
+        active = await _active_unfilled(ticker)
+        lines.append(f"{_e(ticker)}: {'오늘 주문 전송됨' if locked else '오늘 주문 전'}, 미체결 대기 {active}건")
+        rows.append([(f"{ticker} 미체결 상세", f"unfilled:{ticker}"), (f"{ticker} 오늘 주문", f"m_plan:{ticker}")])
+    lines.append("\n이미 주문이 있는 종목에 다시 주문하면 중복 매수가 됩니다. 먼저 /status 와 미체결 상세를 확인하세요.")
+    await wait.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=_kb(*rows))
 
 
-async def cmd_liquidate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from state_manager import STRATEGY
-    args = context.args
-    
-    if not args:
-        # 보유 중인 종목 리스트 추출
-        liquid_targets = [t for t in STRATEGY if STRATEGY[t]["data"]["qty"] > 0]
-        if not liquid_targets:
-            await update.message.reply_text("보유 수량이 있는 종목이 없습니다.")
-            return
-            
-        keyboard = []
-        for ticker in liquid_targets:
-            keyboard.append([InlineKeyboardButton(f"🚨 {ticker} 전량 매도", callback_data=f"ask_liq:{ticker}")])
-            
-        markup = InlineKeyboardMarkup(keyboard)
-        msg = (
-            "🚨 **전량 매매 및 종료(Liquidate) 안내**\n\n"
-            "이 명령은 다음 작업을 수행합니다:\n"
-            "1. 해당 종목의 **모든 잔고를 시장가(MOC)로 즉시 매도**합니다.\n"
-            "2. 봇의 투자 대상 목록에서 **해당 종목 설정을 삭제**합니다.\n"
-            "3. 즉, 해당 종목에 대한 **무한매수 투자를 완전히 종료**합니다.\n\n"
-            "매도할 종목을 선택해 주세요:"
-        )
-        await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=markup)
-        return
-    
-    ticker = args[0].upper()
-    await _execute_liquidate(update, ticker)
-
-async def _execute_liquidate(event, ticker, ord_type="02"):
-    from state_manager import STRATEGY
-    if ticker not in STRATEGY:
-        msg = "해당 종목을 찾을 수 없습니다."
-        if hasattr(event, 'reply_text'): await event.reply_text(msg)
-        else: await event.edit_message_text(msg)
-        return
-    
-    qty = STRATEGY[ticker]["data"]["qty"]
-    if qty <= 0:
-        msg = "보유 수량이 없습니다."
-        if hasattr(event, 'reply_text'): await event.reply_text(msg)
-        else: await event.edit_message_text(msg)
-        return
-        
-    ord_type_name = "시장가(MOC)" if ord_type == "02" else "지정가"
-    curr_p = 0
-    if ord_type == "00":
-        curr_p = await asyncio.to_thread(kis_client.get_current_price, ticker)
-        
-    status_msg = f"🚨 {ticker} {qty}주를 전량 {ord_type_name} 매도 주문 처리합니다..."
-    if hasattr(event, 'reply_text'): await event.reply_text(status_msg)
-    else: await event.edit_message_text(status_msg)
-    
-    from kis_client import send_order
-    res = await asyncio.to_thread(send_order, ticker, int(qty), curr_p, "SELL", ord_type)
-    
-    if res.get('rt_cd') == '0':
-        # [수정] 즉시 삭제하지 않고 liquidating 플래그만 설정
-        # → 장 마감 후 post_close_sync_job에서 체결 확인 및 수익 기록이 완료된 뒤 삭제됩니다.
-        STRATEGY[ticker]["liquidating"] = True
-        utils.set_trade_lock(ticker)
-        final_msg = (
-            f"✅ **{ticker} 전량 매도 주문 전송 완료!**\n\n"
-            f"- {qty}주 {ord_type_name} 매도 주문 접수됨\n"
-            f"- 장 마감 후 체결 확인 및 수익 기록이 자동 처리됩니다.\n"
-            f"- 수익 반영 완료 후 포트폴리오 설정에서 자동 삭제됩니다."
-        )
-        if hasattr(event, 'reply_text'): await event.reply_text(final_msg, parse_mode='Markdown')
-        else: await event.edit_message_text(final_msg, parse_mode='Markdown')
-    else:
-        error_msg = f"❌ 매도 실패: {res.get('msg1')}"
-        if hasattr(event, 'reply_text'): await event.reply_text(error_msg)
-        else: await event.edit_message_text(error_msg)
-
-
-async def _cb_all(update, context, query, parts):
+async def _cb_m_plan(update, context, query, parts):
+    """오늘 계획을 보여 주고 전송 여부를 확인받는다."""
     ticker = parts[1]
-    
-    # 중복 주문 확인 (미체결 주문 존재 여부)
-    try:
-        unfilled = await asyncio.to_thread(kis_client.query_unfilled_orders_today_us, ticker)
-        active_cnt = sum(1 for u in unfilled if u.get("status") == "대기") if unfilled else 0
-        if active_cnt > 0:
-            msg = (
-                f"❌ **{ticker} 수동주문 취소**\n\n"
-                f"계좌에 이미 접수된 미체결 주문({active_cnt}건)이 존재합니다.\n"
-                f"중복 주문을 방지하기 위해 주문을 실행하지 않았습니다."
-            )
-            await query.edit_message_text(msg, parse_mode="Markdown")
-            return
-    except Exception as e:
-        log.warning("수동주문 미체결 확인 중 오류 발생: %s", e)
-
-    info = strategy.build_order_info(ticker)
-    res = await asyncio.to_thread(strategy.execute_all_order, ticker, info)
-    await query.edit_message_text(res)
+    info = await asyncio.to_thread(strategy.build_order_info, ticker)
+    rows = []
+    if info["orders"]:
+        rows.append([("이 주문 전송", f"m_go:{ticker}")])
+    elif info["mode"] == "first" and info["price"] > 0:
+        rows.append([("1주만 진입 (LOC)", f"m_force:{ticker}")])
+    rows.append([("취소", "cancel")])
+    warn = "\n\n오늘 이미 주문이 전송됐습니다. 중복 주의." if utils.check_trade_lock(ticker) else ""
+    await _send(query, UIFormatter.instruction(info) + warn, _kb(*rows))
 
 
-async def _cb_entry(update, context, query, parts):
+async def _cb_m_go(update, context, query, parts):
     ticker = parts[1]
+    if await _active_unfilled(ticker):
+        await query.edit_message_text(f"{ticker}: 이미 접수된 미체결 주문이 있어 중복 방지를 위해 전송하지 않았습니다.")
+        return
+    await query.edit_message_text(f"{ticker} 주문을 전송하는 중입니다.")
+    res = await asyncio.to_thread(TradeService.execute_daily_order, ticker)
+    await _send(query, UIFormatter.order_result(res))
 
-    # 중복 주문 확인 (미체결 주문 존재 여부)
+
+async def _cb_m_force(update, context, query, parts):
+    ticker = parts[1]
+    if await _active_unfilled(ticker):
+        await query.edit_message_text(f"{ticker}: 미체결 대기 주문이 있어 전송하지 않았습니다.")
+        return
+    text, ok = await asyncio.to_thread(strategy.force_first_entry, ticker)
+    if ok:
+        utils.set_trade_lock(ticker)
+        utils.start_cycle_for_new_entry(ticker, increment_on_reentry=True)
+    await _send(query, UIFormatter.order_result(text))
+
+
+async def _cb_unfilled(update, context, query, parts):
+    ticker = parts[1]
     try:
         unfilled = await asyncio.to_thread(kis_client.query_unfilled_orders_today_us, ticker)
-        active_cnt = sum(1 for u in unfilled if u.get("status") == "대기") if unfilled else 0
-        if active_cnt > 0:
-            msg = (
-                f"❌ **{ticker} 수동주문(진입) 취소**\n\n"
-                f"계좌에 이미 접수된 미체결 주문({active_cnt}건)이 존재합니다.\n"
-                f"중복 주문을 방지하기 위해 주문을 실행하지 않았습니다."
-            )
-            await query.edit_message_text(msg, parse_mode="Markdown")
-            return
     except Exception as e:
-        log.warning("수동주문 미체결 확인 중 오류 발생: %s", e)
-
-    # 잔고 0주 진입은 모든 버전 공통으로 1회분 LOC 주문 정보를 strategy에서 재계산해 사용
-    info = await asyncio.to_thread(strategy.build_order_info, ticker)
-    if int(info.get("qty_total", 0) or 0) != 0:
-        await query.edit_message_text(
-            f"ℹ️ {ticker}는 현재 보유 수량이 0주가 아니어서 '새 사이클 진입' 경로를 사용할 수 없습니다.\n"
-            "다시 /manual_order에서 '오늘 LOC 매매 주문'을 사용해 주세요."
-        )
+        await query.edit_message_text(f"미체결 조회 오류: {e}")
         return
-    if int(info.get("b1", 0) or 0) <= 0 or float(info.get("avg_price", 0) or 0) <= 0:
+    if not unfilled:
+        await query.edit_message_text(f"{ticker}: 미국 당일 미체결 주문이 없습니다.")
+        return
+    lines = [f"{u.get('side', '?')} {u.get('qty', 0)}주 @ ${u.get('price', 0.0):.2f} ({u.get('type', '')}) {u.get('status', '')}"
+             for u in sorted(unfilled, key=lambda u: u.get("ord_tmd") or "")]
+    await _send(query, f"<b>{_e(ticker)} 미체결 상세</b> (미국 동부 당일)\n" + pre("\n".join(lines))
+                + "\n'완료'는 주문 처리가 끝났다는 뜻이며 일부 잔량이 남았을 수 있습니다.")
+
+
+# ── 상세 지시서·주문 내역 ────────────────────────────────────────
+
+def _recent_rows(ticker: str, days: int, pages: int) -> list:
+    """사이클 시작일 이후, 주문번호 중복 제거, 의미 있는 가격만, 최신순."""
+    rows = kis_client.query_recent_orders(ticker, days, pages) or []
+    start = ((utils.load_cycle_state().get(ticker, {}).get("active") or {}).get("start_date") or "").replace("-", "")
+    seen, out = set(), []
+    for o in rows:
+        od, dt = o.get("odno"), (o.get("ord_dt") or "").strip()
+        if (od and od in seen) or (start and dt and dt < start):
+            continue
+        if od:
+            seen.add(od)
         try:
-            _excg = kis_client.get_price_exchange_code(ticker)
-        except Exception:
-            _excg = "?"
-        await query.edit_message_text(
-            f"❌ {ticker} 새 사이클 1회분 LOC 주문 정보를 만들지 못했습니다.\n"
-            f"- 시세/기준가 확인 실패(EXCD={_excg})\n"
-            "- 잠시 후 다시 시도하거나 /sync 후 재시도해 주세요."
-        )
-        return
-
-    res = await asyncio.to_thread(strategy.execute_all_order, ticker, info)
-    await query.edit_message_text(res)
-    if "성공" in str(res):
-        utils.set_trade_lock(ticker)
+            if float(o.get("ft_ord_unpr3", o.get("ft_ord_unpr", 0)) or 0) <= 0 and float(o.get("ft_ccld_unpr3", o.get("ft_ccld_unpr", 0)) or 0) <= 0:
+                continue
+        except (TypeError, ValueError):
+            pass
+        out.append(o)
+    return sorted(out, key=lambda o: (o.get("ord_dt") or "", o.get("ord_tmd") or "", o.get("odno") or ""), reverse=True)
 
 
-def _prepare_manual_entry_cycle_state(ticker: str) -> tuple[int, str]:
-    """수동 새 사이클 진입 전 회차 상태를 보정합니다(중복 +1 방지)."""
-    new_cycle, did_inc = utils.start_cycle_for_new_entry(
-        ticker, increment_on_reentry=True
-    )
-    action = "증가" if did_inc else "유지(중복증가 방지)"
-    return new_cycle, action
-
-
-async def _cb_entryask(update, context, query, parts):
-    ticker = parts[1] if len(parts) > 1 else ""
-    if not ticker:
-        await query.edit_message_text("티커 정보가 없어 주문을 진행할 수 없습니다.")
-        return
-
-    tl = utils.get_cycle_timeline(ticker)
-    current_cycle = int(tl.get("current_cycle", 1) or 1)
-    msg = (
-        f"🧭 **{ticker} 새 사이클 수동 진입(잔고 0주)**\n\n"
-        "주문 전 회차 처리를 자동 반영합니다.\n"
-        f"- 현재 회차: {current_cycle}회차\n"
-        f"- 이전 회차: 시작 {tl.get('previous_start', '-')} / 종료 {tl.get('previous_end', '-')}\n"
-        f"- 현재 회차 시작일: {tl.get('current_start', '-')}\n"
-        "- 재진입이면 회차 +1, 이미 반영된 상태면 유지(중복 증가 방지)\n"
-        "- 주문은 모든 버전 공통으로 1회분 LOC 진입으로 전송됩니다."
-    )
-    keyboard = [
-        [InlineKeyboardButton("새 사이클 진입(회차 자동 반영)", callback_data=f"m_entrycycle:{ticker}:auto")],
-        [InlineKeyboardButton("취소", callback_data="cancel")],
-    ]
-    await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def _cb_entrycycle(update, context, query, parts):
-    ticker = parts[1] if len(parts) > 1 else ""
-    if not ticker:
-        await query.edit_message_text("티커 정보가 없어 주문을 진행할 수 없습니다.")
-        return
-
-    info = await asyncio.to_thread(strategy.build_order_info, ticker)
-    if int(info.get("qty_total", 0) or 0) != 0:
-        await query.edit_message_text(
-            f"ℹ️ {ticker}는 현재 보유 수량이 0주가 아니어서 새 사이클 진입을 건너뜁니다.\n"
-            "다시 /manual_order에서 '오늘 LOC 매매 주문'을 사용해 주세요."
-        )
-        return
-    if int(info.get("b1", 0) or 0) <= 0 or float(info.get("avg_price", 0) or 0) <= 0:
-        s = STRATEGY.get(ticker, {})
-        seed = float(s.get("seed", 0) or 0)
-        total_a = float(s.get("total_a", 0) or 0)
-        one_time = strategy.one_time_for_strategy(s) if s else 0.0
-        curr = float(info.get("first_buy_curr_price", 0) or 0)
-        need_split = int(seed // curr) if curr > 0 and seed > 0 else 0
-
-        if curr > 0 and one_time > 0:
-            msg = (
-                f"⚠️ **{ticker} 진입 불가: 1회분 매수금 부족**\n\n"
-                f"- 현재가: ${curr:.2f}\n"
-                f"- 1회분 매수금: ${one_time:.2f} (시드 ${seed:.0f} / 분할 {int(total_a) if total_a > 0 else 0})\n"
-                "- 계산 결과: `floor(1회분/현재가)=0주` 이므로 주문을 만들 수 없습니다.\n\n"
-                "아래 중 하나를 선택해 진행하세요."
-            )
-            kbd = [
-                [InlineKeyboardButton("① 분할/시드 설정 수정", callback_data=f"edit_pick:{ticker}")],
-                [InlineKeyboardButton("③ 이번만 1주 강제 LOC 진입", callback_data=f"m_entryforce:{ticker}")],
-                [InlineKeyboardButton("취소", callback_data="cancel")],
-            ]
-            if need_split >= 1:
-                msg += f"\n\n참고: 현재가 기준 최소 분할횟수는 약 {need_split}회 이하입니다."
-            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kbd))
-            return
-
-        try:
-            _excg = kis_client.get_price_exchange_code(ticker)
-        except Exception:
-            _excg = "?"
-        await query.edit_message_text(
-            f"❌ {ticker} 새 사이클 1회분 LOC 주문 정보를 만들지 못했습니다.\n"
-            f"- 시세/기준가 확인 실패(EXCD={_excg})"
-        )
-        return
-
-    new_cycle, action = _prepare_manual_entry_cycle_state(ticker)
-    res = await asyncio.to_thread(strategy.execute_all_order, ticker, info)
-    tl = utils.get_cycle_timeline(ticker)
-    head = (
-        f"[회차 {action}] {ticker} → 현재 {new_cycle}회차\n"
-        f"- 이전 회차: 시작 {tl.get('previous_start', '-')} / 종료 {tl.get('previous_end', '-')}\n"
-        f"- 현재 회차 시작일: {tl.get('current_start', '-')}\n\n"
-    )
-    await query.edit_message_text(head + str(res))
-    if "성공" in str(res):
-        utils.set_trade_lock(ticker)
-
-
-async def _cb_entryforce(update, context, query, parts):
-    """1회분 부족 시 사용자가 선택한 '이번만 1주 강제 LOC 진입'."""
-    ticker = parts[1] if len(parts) > 1 else ""
-    if not ticker:
-        await query.edit_message_text("티커 정보가 없어 주문을 진행할 수 없습니다.")
-        return
-
+def _i(v) -> int:
     try:
-        unfilled = await asyncio.to_thread(kis_client.query_unfilled_orders_today_us, ticker)
-        active_cnt = sum(1 for u in unfilled if u.get("status") == "대기") if unfilled else 0
-        if active_cnt > 0:
-            await query.edit_message_text(
-                f"❌ {ticker} 강제 진입 취소\n"
-                f"- 계좌에 미체결 대기 주문 {active_cnt}건이 있어 중복 위험이 큽니다."
-            )
-            return
-    except Exception as e:
-        log.warning("강제 진입 전 미체결 확인 실패: %s", e)
-
-    px = 0.0
-    try:
-        p = await asyncio.to_thread(kis_client.get_current_price, ticker)
-        px = float(p or 0)
-    except Exception:
-        px = 0.0
-    if px <= 0:
-        try:
-            p2 = await asyncio.to_thread(kis_client.get_prev_close, ticker)
-            px = float(p2 or 0)
-        except Exception:
-            px = 0.0
-    if px <= 0:
-        await query.edit_message_text(
-            f"❌ {ticker} 강제 진입 실패: 현재가/전일가를 가져오지 못했습니다."
-        )
-        return
-
-    loc_price = round(px * 1.10, 2)
-    new_cycle, action = _prepare_manual_entry_cycle_state(ticker)
-    res = await asyncio.to_thread(kis_client.send_order, ticker, 1, loc_price, "BUY", "LOC")
-
-    tl = utils.get_cycle_timeline(ticker)
-    msg = (
-        f"[회차 {action}] {ticker} 1주 강제 LOC 진입\n"
-        f"- 주문: 1주 @ ${loc_price:.2f} (기준가 ${px:.2f})\n"
-        f"- 이전 회차: 시작 {tl.get('previous_start', '-')} / 종료 {tl.get('previous_end', '-')}\n"
-        f"- 현재 회차: {new_cycle}회차 (시작일 {tl.get('current_start', '-')})\n"
-        f"- 결과: {res.get('msg1', '')}"
-    )
-    await query.edit_message_text(msg)
-    if res.get("rt_cd") == "0":
-        utils.set_trade_lock(ticker)
+        return int(float(v or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 async def _cb_status_dive(update, context, query, parts):
     ticker = parts[1]
-    s = STRATEGY.get(ticker, {})
-    ver = strategy.format_method_display(s.get("method", "2.2"))
-    theory_msg = strategy.generate_ticker_message(ticker)
-
-    # 최근 주문/체결 내역(증권사 서버) 조회: 날짜/시간 포함
+    info = await asyncio.to_thread(strategy.build_order_info, ticker)
+    text = UIFormatter.instruction(info)
+    buttons = []
     try:
-        recent = await asyncio.to_thread(
-            kis_client.query_recent_orders, ticker, 5, 3
-        )
-    except Exception:
-        recent = []
-
-    # 사이클 시작일 이후 내역만 표시 (없으면 최근 N일 그대로)
-    try:
-        cycle_state = utils.load_cycle_state()
-        _cs_info = cycle_state.get(ticker, {}) or {}
-        _cs_active = _cs_info.get("active") or {}
-        start_date_str = _cs_active.get("start_date") or ""
-        start_ymd = start_date_str.replace("-", "") if start_date_str else ""
-    except Exception:
-        start_ymd = ""
-
-    if recent:
-        # 주문번호 기준 중복 제거
-        seen = set()
-        rows = []
-        for o in recent:
-            odno = o.get("odno")
-            if odno and odno in seen:
-                continue
-            if odno:
-                seen.add(odno)
-            rows.append(o)
-
-        # (필터) 사이클 시작일 이전 데이터 제거 + 0가격 잡음 제거
-        filtered = []
+        rows = await asyncio.to_thread(_recent_rows, ticker, 5, 3)
+        ny = pytz.timezone("US/Eastern")
+        import datetime as _dt
+        now = _dt.datetime.now(ny)
+        days = {(label, d): [] for label, d in (("오늘", now.strftime("%Y%m%d")), ("전일", (now - _dt.timedelta(days=1)).strftime("%Y%m%d")))}
         for o in rows:
-            ord_dt = (o.get("ord_dt") or "").strip()
-            if start_ymd and ord_dt and ord_dt < start_ymd:
+            for key in days:
+                if (o.get("ord_dt") or "").strip() == key[1]:
+                    days[key].append(o)
+        lines = []
+        for (label, d), day in days.items():
+            if not day:
+                lines.append(f"{label}: 내역 없음")
                 continue
-            try:
-                ord_pr = float(o.get("ft_ord_unpr3", o.get("ft_ord_unpr", "0") or 0) or 0)
-                ccld_pr = float(o.get("ft_ccld_unpr3", o.get("ft_ccld_unpr", "0") or 0) or 0)
-                # LOC/지정가 계열에서 0.00은 의미 없는 잡음으로 간주 (예외 케이스는 남겨도 되지만 노이즈가 큼)
-                if ord_pr <= 0 and ccld_pr <= 0:
-                    continue
-            except Exception:
-                pass
-            filtered.append(o)
-        rows = filtered
-
-        # 최신순 정렬 (ord_dt/ord_tmd)
-        def _k(o):
-            return (o.get("ord_dt") or "", o.get("ord_tmd") or "", o.get("odno") or "")
-
-        rows = sorted(rows, key=_k, reverse=True)
-
-        # 오늘/전일 기준으로 요약 표시 (길이 축소) + 필요 시 날짜별 상세 버튼 제공
-        try:
-            import datetime as _dt
-            import pytz as _pytz
-            est = _pytz.timezone("US/Eastern")
-            now_est = _dt.datetime.now(est)
-            today_ymd = now_est.strftime("%Y%m%d")
-            yday_ymd = (now_est - _dt.timedelta(days=1)).strftime("%Y%m%d")
-        except Exception:
-            today_ymd = ""
-            yday_ymd = ""
-
-        def _summarize_day(day_rows):
-            stats = {
-                "buy_ord": 0,
-                "sell_ord": 0,
-                "buy_ccld": 0,
-                "sell_ccld": 0,
-                "left": 0,
-                "status": {},
-                "count": 0,
-            }
-            for o in day_rows:
-                stats["count"] += 1
-                side_cd = o.get("sll_buy_dvsn_cd")
-                is_buy = side_cd == "02"
-                try:
-                    ord_qty = int(float(o.get("ft_ord_qty", "0") or 0))
-                    ccld_qty = int(float(o.get("ft_ccld_qty", "0") or 0))
-                    nccs_qty = int(float(o.get("nccs_qty", "0") or 0))
-                except Exception:
-                    ord_qty, ccld_qty, nccs_qty = 0, 0, 0
-                if is_buy:
-                    stats["buy_ord"] += ord_qty
-                    stats["buy_ccld"] += ccld_qty
-                else:
-                    stats["sell_ord"] += ord_qty
-                    stats["sell_ccld"] += ccld_qty
-                stats["left"] += max(nccs_qty, 0)
-                st = (o.get("prcs_stat_name") or "").strip() or "?"
-                stats["status"][st] = stats["status"].get(st, 0) + 1
-            return stats
-
-        def _fmt_status_counts(status_map):
-            # 상위 2개만 노출
-            items = sorted(status_map.items(), key=lambda kv: kv[1], reverse=True)
-            return ", ".join([f"{k}{v}" for k, v in items[:2]]) if items else "-"
-
-        day_map = {}
-        for o in rows:
-            d = (o.get("ord_dt") or "").strip()
-            if not d:
-                continue
-            day_map.setdefault(d, []).append(o)
-
-        scope_label = (
-            f"사이클 시작일({start_ymd[:4]}-{start_ymd[4:6]}-{start_ymd[6:8]}) 이후"
-            if start_ymd
-            else "최근 5일"
-        )
-        order_summary = f"\n📝 **증권사 주문 내역 요약({scope_label})**\n"
-
-        keyboard = []
-        for label, d in (("오늘", today_ymd), ("전일", yday_ymd)):
-            if not d or d not in day_map:
-                order_summary += f"- {label}: 내역 없음\n"
-                continue
-            s = _summarize_day(day_map[d])
-            d_disp = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
-            order_summary += (
-                f"- {label}({d_disp}): "
-                f"매수 주문 {s['buy_ord']}주/체결 {s['buy_ccld']}주, "
-                f"매도 주문 {s['sell_ord']}주/체결 {s['sell_ccld']}주, "
-                f"잔량 {s['left']}주, 상태({ _fmt_status_counts(s['status']) })\n"
-            )
-            keyboard.append([InlineKeyboardButton(f"📄 {label} 상세보기", callback_data=f"orders_day:{ticker}:{d}")])
-
-        if keyboard:
-            order_summary += "\n(상세가 필요하면 아래 버튼을 눌러 확인하세요.)\n"
-        else:
-            order_summary += "\n(오늘/전일 내역이 없습니다.)\n"
-    else:
-        order_summary = "\n⚠️ **증권사 주문 내역을 가져오지 못했습니다.**\n(휴장일/네트워크/조회기간 이슈일 수 있습니다.)\n"
-    content = (
-        f"🔍 **{ticker} 상세 매매 지시서 (Deep-Dive)**\n"
-        f"📌 무한매수 버전: **{ver}**\n"
-        "--------------------------\n"
-        f"{theory_msg}\n{order_summary}"
-    )
-    if recent and 'keyboard' in locals() and keyboard:
-        await query.message.reply_text(content, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        await query.message.reply_text(content, parse_mode="Markdown")
+            b_ord = sum(_i(o.get("ft_ord_qty")) for o in day if o.get("sll_buy_dvsn_cd") == "02")
+            b_ccl = sum(_i(o.get("ft_ccld_qty")) for o in day if o.get("sll_buy_dvsn_cd") == "02")
+            s_ord = sum(_i(o.get("ft_ord_qty")) for o in day if o.get("sll_buy_dvsn_cd") != "02")
+            s_ccl = sum(_i(o.get("ft_ccld_qty")) for o in day if o.get("sll_buy_dvsn_cd") != "02")
+            lines.append(f"{label}({d[:4]}-{d[4:6]}-{d[6:8]}): 매수 {b_ccl}/{b_ord}주 체결, 매도 {s_ccl}/{s_ord}주 체결")
+            buttons.append((f"{label} 상세", f"orders_day:{ticker}:{d}"))
+        text += "\n\n<b>증권사 주문 내역</b>\n" + "\n".join(_e(x) for x in lines)
+    except Exception as e:
+        log.warning("status_dive orders failed: %s", e)
+        text += "\n\n증권사 주문 내역을 가져오지 못했습니다."
+    await query.message.reply_text(text, parse_mode="HTML", reply_markup=_kb(buttons) if buttons else None)
 
 
 async def _cb_orders_day(update, context, query, parts):
-    """일자별 주문 상세 보기."""
-    ticker = parts[1] if len(parts) > 1 else ""
-    ymd = parts[2] if len(parts) > 2 else ""
-    if not ticker or not ymd:
-        await query.edit_message_text("요청 정보가 부족합니다.")
-        return
-
-    try:
-        recent = await asyncio.to_thread(
-            kis_client.query_recent_orders, ticker, 10, 4
-        )
-    except Exception:
-        recent = []
-
-    # 사이클 시작일 이후 내역만 표시 (없으면 최근 N일 그대로)
-    try:
-        cycle_state = utils.load_cycle_state()
-        _cs_info = cycle_state.get(ticker, {}) or {}
-        _cs_active = _cs_info.get("active") or {}
-        start_date_str = _cs_active.get("start_date") or ""
-        start_ymd = start_date_str.replace("-", "") if start_date_str else ""
-    except Exception:
-        start_ymd = ""
-
-    rows = []
-    for o in recent or []:
-        ord_dt = (o.get("ord_dt") or "").strip()
-        if start_ymd and ord_dt and ord_dt < start_ymd:
-            continue
-        if ord_dt != ymd:
-            continue
-        try:
-            ord_pr = float(o.get("ft_ord_unpr3", o.get("ft_ord_unpr", "0") or 0) or 0)
-            ccld_pr = float(o.get("ft_ccld_unpr3", o.get("ft_ccld_unpr", "0") or 0) or 0)
-            if ord_pr <= 0 and ccld_pr <= 0:
-                continue
-        except Exception:
-            pass
-        rows.append(o)
-
-    rows = sorted(rows, key=lambda o: (o.get("ord_tmd") or "", o.get("odno") or ""), reverse=True)
-    d_disp = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}" if len(ymd) >= 8 else ymd
-
+    ticker, ymd = parts[1], parts[2]
+    rows = [o for o in await asyncio.to_thread(_recent_rows, ticker, 10, 4) if (o.get("ord_dt") or "").strip() == ymd]
+    title = f"<b>{_e(ticker)} {ymd[:4]}-{ymd[4:6]}-{ymd[6:8]} 주문 상세</b>\n"
     if not rows:
-        await query.edit_message_text(f"📄 **{ticker} {d_disp} 주문 상세**\n\n- 내역이 없습니다.", parse_mode="Markdown")
+        await query.edit_message_text(title + "내역이 없습니다.", parse_mode="HTML")
         return
-
-    msg = f"📄 **{ticker} {d_disp} 주문 상세**\n\n"
-    for o in rows[:30]:
-        ord_tmd = (o.get("ord_tmd") or "").strip()
-        tm_disp = f"{ord_tmd[:2]}:{ord_tmd[2:4]}:{ord_tmd[4:6]}" if len(ord_tmd) >= 6 else ""
-        side_name = (o.get("sll_buy_dvsn_cd_name") or "").strip()
-        if not side_name:
-            side_name = "매수" if o.get("sll_buy_dvsn_cd") == "02" else "매도"
-        ord_qty = int(float(o.get("ft_ord_qty", "0") or 0))
-        ord_pr = float(o.get("ft_ord_unpr3", o.get("ft_ord_unpr", "0") or 0) or 0)
-        ccld_qty = int(float(o.get("ft_ccld_qty", "0") or 0))
-        ccld_pr = float(o.get("ft_ccld_unpr3", o.get("ft_ccld_unpr", "0") or 0) or 0)
-        nccs_qty = int(float(o.get("nccs_qty", "0") or 0))
-        status = (o.get("prcs_stat_name") or "").strip()
-        msg += f"- {tm_disp} {side_name} {ord_qty}주 @ ${ord_pr:.2f} → 체결 {ccld_qty}주 @ ${ccld_pr:.2f} / 잔량 {nccs_qty}주 ({status})\n"
-
-    if len(rows) > 30:
-        msg += "\n... (생략)\n"
-    await query.edit_message_text(msg, parse_mode="Markdown")
+    lines = []
+    for o in sorted(rows, key=lambda o: (o.get("ord_tmd") or "", o.get("odno") or ""), reverse=True)[:30]:
+        t = (o.get("ord_tmd") or "").strip()
+        tm = f"{t[:2]}:{t[2:4]}" if len(t) >= 4 else ""
+        side = (o.get("sll_buy_dvsn_cd_name") or "").strip() or ("매수" if o.get("sll_buy_dvsn_cd") == "02" else "매도")
+        lines.append(f"{tm} {side} {_i(o.get('ft_ord_qty'))}주 @ ${float(o.get('ft_ord_unpr3', o.get('ft_ord_unpr', 0)) or 0):.2f}"
+                     f" → 체결 {_i(o.get('ft_ccld_qty'))}주 @ ${float(o.get('ft_ccld_unpr3', o.get('ft_ccld_unpr', 0)) or 0):.2f}"
+                     f" ({(o.get('prcs_stat_name') or '').strip()})")
+    await query.edit_message_text(title + pre("\n".join(lines)), parse_mode="HTML")
 
 
-async def _cb_unfilled(update, context, query, parts):
-    """선택 전 검증: 해당 종목의 미체결 주문 상세를 보여줍니다."""
-    ticker = parts[1] if len(parts) > 1 else ""
-    if not ticker:
-        await query.edit_message_text("티커 정보가 없습니다.")
+# ── 수익 기록 ────────────────────────────────────────────────────
+
+async def cmd_profit_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cp = utils.load_cumul_profit()
+    history = [h for h in (cp.get("history") or []) if isinstance(h, dict)]
+    totals = utils.aggregate_cumul_profit_by_ticker(cp)
+    if not history:
+        extra = "\n".join(f"{t}: ${v:,.2f}" for t, v in sorted(totals.items()) if abs(v) > 1e-9)
+        await update.message.reply_text("확정된 건별 익절 기록이 없습니다." + (f"\n종목별 누적:\n{extra}" if extra else
+                                        "\n목표가 익절이 체결되면 날짜와 손익이 여기에 쌓입니다."))
         return
-
-    try:
-        unfilled = await asyncio.to_thread(kis_client.query_unfilled_orders_today_us, ticker)
-    except Exception as e:
-        await query.edit_message_text(f"미체결 조회 오류: {str(e)}")
-        return
-
-    if not unfilled:
-        msg = (
-            f"🔎 **{ticker} 미체결 상세 (미국 동부 당일)**\n\n"
-            "- 당일(미국) 미체결 주문이 없습니다."
-        )
-        # 미체결이 없으면 바로 주문 진행 버튼을 제공
-        info = strategy.build_order_info(ticker)
-        if info.get("qty_total", 0) == 0:
-            cb = f"m_entryask:{ticker}"
-            buttons = [[InlineKeyboardButton(f"🚀 {ticker} 오늘 LOC 진입 주문", callback_data=cb)]]
-        else:
-            buttons = [[InlineKeyboardButton(f"🏦 {ticker} 오늘 LOC 매매 주문", callback_data=f"m_all:{ticker}")]]
-        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    # 날짜별로 묶어서 표시 (미국 현지 ord_dt 기준)
-    def _date_key(u):
-        return u.get("ord_dt") or "unknown"
-
-    unfilled_sorted = sorted(unfilled, key=lambda u: (_date_key(u), u.get("ord_tmd") or "", u.get("ord_no") or ""))
-    groups = {}
-    for u in unfilled_sorted:
-        groups.setdefault(_date_key(u), []).append(u)
-
-    msg = f"🔎 **{ticker} 미체결 상세 (미국 동부 당일)**\n\n"
-    for ord_dt, items in groups.items():
-        if ord_dt and len(ord_dt) >= 8:
-            dt_disp = f"{ord_dt[:4]}-{ord_dt[4:6]}-{ord_dt[6:8]}"
-        else:
-            dt_disp = "날짜 미상"
-        msg += f"📅 **{dt_disp}**\n"
-        for u in items:
-            side = u.get("side", "?")
-            qty = u.get("qty", 0)
-            price = u.get("price", 0.0)
-            typ = u.get("type", "")
-            status = u.get("status", "")
-            tmd = u.get("ord_tmd") or ""
-            tmd_disp = f"{tmd[:2]}:{tmd[2:4]}:{tmd[4:6]}" if len(tmd) >= 6 else ""
-            prefix = f"{tmd_disp} " if tmd_disp else ""
-            msg += f"• {prefix}{side} {qty}주 @ ${price:.2f} ({typ}) - {status}\n"
-        msg += "\n"
-
-    msg += (
-        "ℹ️ **'완료'의 의미**\n"
-        "- 증권사 기준으로 해당 주문 건의 **처리 상태가 종료(완료)** 되었음을 의미합니다.\n"
-        "- 다만 이 리스트는 `주문수량 > 체결수량`인 경우를 모아 보여주므로, '완료'라도 **일부 미체결 잔량**이 남아 있을 수 있습니다.\n"
-        "- (예) 지정가/LOC 조건 불충족으로 체결이 끝나고 주문이 종료된 경우, 또는 일부 체결 후 잔량이 남은 채로 종료된 경우\n\n"
-        "⚠️ 위 미체결(또는 잔량)이 이미 존재한다면, 추가 주문은 중복/과매수가 될 수 있습니다.\n"
-    )
-
-    # 이 화면에서 바로 주문 진행 버튼 제공
-    info = strategy.build_order_info(ticker)
-    if info.get("qty_total", 0) == 0:
-        cb = f"m_entryask:{ticker}"
-        buttons = [[InlineKeyboardButton(f"🚀 {ticker} 오늘 LOC 진입 주문", callback_data=cb)]]
-    else:
-        buttons = [[InlineKeyboardButton(f"🏦 {ticker} 오늘 LOC 매매 주문", callback_data=f"m_all:{ticker}")]]
-
-    await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
-
-
-def _format_profit_history_row(h: dict) -> str:
-    """history 한 줄 (텔레그램 길이·파싱 실패에 덜 취약하게)."""
-    vlab = strategy.format_method_display(h.get("method"))
-    d = h.get("date", "?")
-    tic = str(h.get("ticker") or "?").strip().upper()
-    try:
-        sq = int(h.get("sell_qty", h.get("qty", 0)) or 0)
-    except (TypeError, ValueError):
-        sq = 0
-    try:
-        ap = float(h.get("avg_price", h.get("avg", 0)) or 0)
-    except (TypeError, ValueError):
-        ap = 0.0
-    try:
-        sp = float(h.get("sell_price", h.get("sell", 0)) or 0)
-    except (TypeError, ValueError):
-        sp = 0.0
-    try:
-        pf = float(h.get("profit") or 0)
-    except (TypeError, ValueError):
-        pf = 0.0
-    od = str(h.get("order_no") or "").strip()
-    od_s = f" | 주문:{od}" if od else ""
-    return f"• {d} | {tic} | {vlab} | {sq}주 | 평단:${ap:.2f}/매도:${sp:.2f} | **${pf:+,.2f}**{od_s}\n"
+    lines = [f"누적 {t}: ${v:,.2f}" for t, v in sorted(totals.items())] + ["", "최근 5건 (날짜, 종목, 수량, 매도가, 손익)"]
+    for h in history[-5:]:
+        lines.append(f"{str(h.get('date', '?'))[:10]} {h.get('ticker', '?')} {_i(h.get('sell_qty'))}주 "
+                     f"${float(h.get('sell_price') or 0):.2f} {float(h.get('profit') or 0):+,.2f}")
+    await update.message.reply_text("<b>실현 수익 요약</b>\n" + pre("\n".join(lines)), parse_mode="HTML",
+                                    reply_markup=_kb([("전체 기록 보기", "profit_dive")]))
 
 
 async def _cb_profit_dive(update, context, query, parts):
-    cp = utils.load_cumul_profit()
-    history = [h for h in (cp.get("history") or []) if isinstance(h, dict)]
+    history = [h for h in (utils.load_cumul_profit().get("history") or []) if isinstance(h, dict)]
     if not history:
-        await query.message.reply_text(
-            "건별 `history`가 없습니다. `/profit_history` 요약과 같습니다.\n"
-            "누적만 있는 경우 `/report`를 확인하세요."
-        )
+        await query.message.reply_text("건별 기록이 없습니다.")
         return
-    # 텔레그램 단일 메시지 상한(4096) 대비 여유 있게 분할
-    chunk_size = 18
-    for i in range(0, len(history), chunk_size):
-        chunk = history[i : i + chunk_size]
-        part_n = i // chunk_size + 1
-        total_parts = (len(history) + chunk_size - 1) // chunk_size
-        msg = f"📜 **전체 수익 기록** ({part_n}/{total_parts})\n\n"
-        for h in chunk:
-            msg += _format_profit_history_row(h)
-        try:
-            await query.message.reply_text(msg, parse_mode="Markdown")
-        except Exception:
-            await query.message.reply_text(msg)
+    for i in range(0, len(history), 20):
+        chunk = history[i:i + 20]
+        lines = [f"{str(h.get('date', '?'))[:16]} {h.get('ticker', '?'):<5}{_i(h.get('sell_qty')):>4}주 "
+                 f"평단${float(h.get('avg_price') or 0):.2f} 매도${float(h.get('sell_price') or 0):.2f} {float(h.get('profit') or 0):+,.2f}"
+                 for h in chunk]
+        await query.message.reply_text(f"<b>전체 수익 기록</b> ({i // 20 + 1}/{(len(history) + 19) // 20})\n" + pre("\n".join(lines)),
+                                       parse_mode="HTML")
 
 
-TG_MESSAGE_SAFE = 3900
+async def cmd_profit_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("누적 실현수익 기록을 모두 지웁니다. 되돌릴 수 없습니다. 계속할까요?",
+                                    reply_markup=_kb([("초기화", "exec_reset"), ("취소", "cancel")]))
 
 
-async def _reply_long_markdown(message, text: str) -> None:
-    """Markdown 본문이 길면 여러 메시지로 나눕니다(이론 가이드용)."""
-    t = (text or "").strip()
-    if not t:
-        await message.reply_text("(내용 없음)")
+async def _cb_exec_reset(update, context, query, parts):
+    utils.save_cumul_profit({"history": [], "processed_orders": []})
+    await query.edit_message_text("누적 실현수익 기록을 초기화했습니다.")
+
+
+# ── 종목 설정 ────────────────────────────────────────────────────
+
+_TICKER_RE = re.compile(r"^[A-Z]{1,6}$")
+
+
+def _parse_target_args(args: list[str], current: dict | None):
+    """(ticker, seed, n, target, error). 수익%는 TQQQ/SOXL이면 공식 값(15/20)이 자동 적용된다."""
+    ticker = args[0].upper()
+    if not _TICKER_RE.match(ticker):
+        return None, 0, 0, 0, "종목 코드는 영문 대문자 1~6자로 입력하세요."
+    try:
+        seed, n = float(args[1]), float(args[2])
+        target = float(args[3]) if len(args) > 3 else float((current or {}).get("target_profit", 10.0))
+    except ValueError:
+        return None, 0, 0, 0, "원금, 분할 수, 수익%는 숫자로 입력하세요."
+    if seed <= 0:
+        return None, 0, 0, 0, "원금은 0보다 커야 합니다."
+    if int(n) != n or not 5 <= n <= 300:
+        return None, 0, 0, 0, "분할 수는 5~300 사이 정수로 입력하세요 (권장 20 또는 40)."
+    if not 0 < target <= 200:
+        return None, 0, 0, 0, "수익%는 0보다 크고 200 이하여야 합니다."
+    return ticker, seed, int(n), target, ""
+
+
+def _target_usage(cmd: str) -> str:
+    return (f"사용법: /{cmd} 종목 원금 분할수 [수익%]\n예: /{cmd} TQQQ 8000 20\n"
+            "TQQQ는 +15%, SOXL은 +20% 지정가 익절이 자동 적용됩니다. 그 외 종목은 수익%(기본 10)를 씁니다.\n"
+            "분할 수는 20 또는 40을 권장합니다. 공식 V4.0은 TQQQ와 SOXL만 다룹니다.")
+
+
+async def _save_target(update, args, adding: bool):
+    cmd = "add_target" if adding else "edit_target"
+    from config_manager import STRATEGY_SETTINGS, save_config
+    prev = STRATEGY_SETTINGS.get(args[0].upper()) if args else None
+    if len(args) < 3 or (not adding and not prev):
+        await update.message.reply_text(_target_usage(cmd) + ("\n등록 종목: " + ", ".join(STRATEGY) if not adding else ""))
         return
-
-    async def _send_chunk(chunk: str) -> None:
-        try:
-            await message.reply_text(chunk, parse_mode="Markdown")
-        except Exception:
-            # Telegram Markdown: 밑줄·별표 불균형 등으로 파싱 실패 시 그대로 전송
-            await message.reply_text(chunk)
-
-    while t:
-        if len(t) <= TG_MESSAGE_SAFE:
-            await _send_chunk(t)
-            break
-        cut = t.rfind("\n\n", 0, TG_MESSAGE_SAFE)
-        if cut < TG_MESSAGE_SAFE // 3:
-            cut = TG_MESSAGE_SAFE
-        part = t[:cut].strip()
-        t = t[cut:].strip()
-        if part:
-            await _send_chunk(part)
-
-
-async def _cb_guide(update, context, query, parts):
-    guide_type = parts[1]
-    content = GUIDE_TEXTS.get(guide_type, "")
-    if not content:
-        await query.message.reply_text("해당 가이드가 없습니다.")
+    ticker, seed, n, target, err = _parse_target_args(args, prev)
+    if err:
+        await update.message.reply_text(err)
         return
-    if guide_type.startswith("theory_"):
-        await _reply_long_markdown(query.message, content)
-    else:
-        await query.message.reply_text(content, parse_mode="Markdown")
+    new_settings = dict(STRATEGY_SETTINGS)
+    new_settings[ticker] = {"seed": seed, "total_a": n, "target_profit": target}
+    if not save_config({"STRATEGY_SETTINGS": new_settings}):
+        await update.message.reply_text("설정 저장에 실패했습니다.")
+        return
+    STRATEGY[ticker] = state_manager.make_entry(new_settings[ticker], STRATEGY.get(ticker, {}).get("data"))
+    note = "" if adding else "\n진행 중인 사이클의 T와 잔금은 그대로입니다. 필요하면 /set_t 로 보정하세요."
+    if ticker not in ("TQQQ", "SOXL"):
+        note += "\nTQQQ와 SOXL 외 종목은 공식 방법론의 검증 대상이 아닙니다."
+    await update.message.reply_text(
+        f"{ticker} 설정을 {'추가' if adding else '수정'}했습니다.\n원금 ${seed:,.0f}, {n}분할, 1회 ${seed / n:,.0f}, "
+        f"지정가 익절 +{strategy.profit_target_pct(ticker):g}%{note}")
+
+
+async def cmd_add_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _save_target(update, context.args, adding=True)
+
+
+async def cmd_edit_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args and STRATEGY:
+        rows = [[(f"{t} 수정 방법", f"edit_pick:{t}")] for t in STRATEGY]
+        await update.message.reply_text("수정할 종목을 고르세요.", reply_markup=_kb(*rows))
+        return
+    await _save_target(update, context.args, adding=False)
+
+
+async def _cb_edit_pick(update, context, query, parts):
+    s = STRATEGY.get(parts[1])
+    if not s:
+        await query.edit_message_text("등록되지 않은 종목입니다.")
+        return
+    await query.edit_message_text(
+        f"{parts[1]} 현재 원금 ${s['seed']:,.0f}, {s['total_a']:g}분할.\n"
+        f"이 형식으로 보내세요: /edit_target {parts[1]} {s['seed']:g} {s['total_a']:g}")
+
+
+async def cmd_del_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not STRATEGY:
+        await update.message.reply_text("등록된 종목이 없습니다.")
+        return
+    if context.args:
+        await _confirm_del(update.message, context.args[0].upper())
+        return
+    rows = [[(f"{t} 삭제", f"ask_del:{t}")] for t in STRATEGY]
+    await update.message.reply_text("감시를 중단할 종목을 고르세요. 실제 계좌의 주식은 팔리지 않습니다.", reply_markup=_kb(*rows))
+
+
+async def _confirm_del(event, ticker: str):
+    if ticker not in STRATEGY:
+        await _send(event, f"{_e(ticker)}는 등록된 종목이 아닙니다.")
+        return
+    await _send(event, f"<b>{_e(ticker)}</b> 감시를 중단할까요? 계좌의 주식은 그대로 남고 봇만 더 이상 관리하지 않습니다.",
+                _kb([("삭제", f"exec_del:{ticker}"), ("취소", "cancel")]))
 
 
 async def _cb_ask_del(update, context, query, parts):
-    ticker = parts[1]
-    keyboard = [
-        [InlineKeyboardButton("✅ 확인", callback_data=f"exec_del:{ticker}"), InlineKeyboardButton("❌ 취소", callback_data="cancel")],
-    ]
-    await query.edit_message_text(
-        f"🗑️ **{ticker}**를 정말로 삭제하시겠습니까?\n\n(참고: 감시만 중단되며 실제 주식은 팔지 않습니다.)",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    await _confirm_del(query, parts[1])
 
 
 async def _cb_exec_del(update, context, query, parts):
-    await _execute_del_target(query, parts[1])
+    ticker = parts[1]
+    from config_manager import STRATEGY_SETTINGS, save_config
+    new_settings = {k: v for k, v in STRATEGY_SETTINGS.items() if k != ticker}
+    if ticker not in STRATEGY_SETTINGS or not save_config({"STRATEGY_SETTINGS": new_settings}):
+        await query.edit_message_text("삭제하지 못했습니다.")
+        return
+    STRATEGY.pop(ticker, None)
+    utils.delete_ticker_from_all_states(ticker)
+    await query.edit_message_text(f"{ticker} 감시를 중단했습니다.")
+
+
+# ── 긴급 청산 ────────────────────────────────────────────────────
+
+async def cmd_liquidate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    held = [t for t in STRATEGY if STRATEGY[t]["data"]["qty"] > 0]
+    if not held:
+        await update.message.reply_text("보유 수량이 있는 종목이 없습니다.")
+        return
+    if context.args and context.args[0].upper() in held:
+        await _ask_liq(update.message, context.args[0].upper())
+        return
+    await update.message.reply_text(
+        "<b>전량 매도 후 종료</b>\n보유 전량을 매도하고 체결이 확인되면 이 종목의 감시 설정을 삭제합니다. 종목을 고르세요.",
+        parse_mode="HTML", reply_markup=_kb(*[[(f"{t} 전량 매도", f"ask_liq:{t}")] for t in held]))
+
+
+async def _ask_liq(event, ticker: str):
+    await _send(event, f"<b>{_e(ticker)}</b> 사이클을 종료합니다. 매도 방식을 고르세요.",
+                _kb([("시장가 MOC", f"exec_liq:{ticker}:02"), ("현재가 지정가", f"exec_liq:{ticker}:00")], [("취소", "cancel")]))
 
 
 async def _cb_ask_liq(update, context, query, parts):
-    ticker = parts[1]
-    keyboard = [
-        [
-            InlineKeyboardButton("🚀 시장가(MOC) 매도", callback_data=f"exec_liq:{ticker}:02"),
-            InlineKeyboardButton("🎯 지정가(현재가) 매도", callback_data=f"exec_liq:{ticker}:00"),
-        ],
-        [InlineKeyboardButton("❌ 취소", callback_data="cancel")],
-    ]
-    await query.edit_message_text(
-        f"🚨 **{ticker}** 사이클을 완전히 종료하시겠습니까?\n\n"
-        "아래 매도 방식을 선택해 주세요.\n"
-        "장 마감 후 체결 확인 및 수익 기록이 완료되면 설정이 자동 삭제됩니다.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    await _ask_liq(query, parts[1])
 
 
 async def _cb_exec_liq(update, context, query, parts):
-    # parts: ["exec_liq", ticker, ord_type]
-    ord_type = parts[2] if len(parts) >= 3 else "02"
-    await _execute_liquidate(query, parts[1], ord_type=ord_type)
+    ticker = parts[1]
+    ord_type = parts[2] if len(parts) > 2 else "02"
+    if ticker not in STRATEGY or STRATEGY[ticker]["data"]["qty"] <= 0:
+        await query.edit_message_text("보유 수량이 없습니다.")
+        return
+    qty = int(STRATEGY[ticker]["data"]["qty"])
+    price = 0.0
+    if ord_type == "00":
+        price = await asyncio.to_thread(kis_client.get_current_price, ticker)
+    name = "시장가(MOC)" if ord_type == "02" else "지정가"
+    await query.edit_message_text(f"{ticker} {qty}주 전량 {name} 매도 주문 중입니다.")
+    res = await asyncio.to_thread(kis_client.send_order, ticker, qty, price, "SELL", "MOC" if ord_type == "02" else "00")
+    if res.get("rt_cd") != "0":
+        await query.edit_message_text(f"매도 실패: {res.get('msg1')}")
+        return
+    STRATEGY[ticker]["liquidating"] = True  # 체결 확인과 수익 기록이 끝난 뒤 장 마감 후 동기화에서 삭제
+    utils.set_trade_lock(ticker)
+    await query.edit_message_text(
+        f"{ticker} 전량 매도 주문을 접수했습니다.\n장 마감 후 체결 확인과 수익 기록이 끝나면 설정이 자동으로 삭제됩니다.")
 
 
 async def _cb_cancel(update, context, query, parts):
     await query.edit_message_text("작업이 취소되었습니다.")
 
 
-async def _cb_edit_pick(update, context, query, parts):
-    """edit_target 워크플로우: 수정할 티커 선택 → 단계별 입력 시작."""
-    ticker = parts[1] if len(parts) > 1 else ""
-    if not ticker:
-        await query.edit_message_text("티커 정보가 없습니다.")
-        return
-
-    from state_manager import STRATEGY
-    if ticker not in STRATEGY:
-        await query.edit_message_text(f"❌ {ticker} 종목은 현재 투자 대상이 아닙니다.")
-        return
-
-    s = STRATEGY[ticker]
-    method = s.get("method", "2.2")
-    # V3.0/V4.0 TQQQ/SOXL: 수익률 자동 적용 여부 판단
-    auto_profit = None
-    if method in ("3.0", "4.0"):
-        auto_profit = _v30_v40_hardcoded_profit(ticker)
-
-    context.user_data["pending_edit_target"] = {
-        "ticker": ticker,
-        "stage": "seed",
-        "seed": None,
-        "total_a": None,
-        "profit": None,
-        "auto_profit": auto_profit,
-        "current": {
-            "seed": s.get("seed", 0),
-            "total_a": s.get("total_a", 0),
-            "profit": s.get("target_profit", 0),
-            "method": method,
-            "one_time_usd": s.get("one_time_usd"),
-        },
-    }
-
-    cur = context.user_data["pending_edit_target"]["current"]
-    ot_disp = cur.get("one_time_usd")
-    ot_line = f"\n- <code>one_time_usd</code>: <code>{ot_disp}</code>" if ot_disp is not None else ""
-
-    if auto_profit is not None:
-        # V3.0/V4.0 TQQQ/SOXL: 2단계만 (시드 → 분할횟수)
-        msg = (
-            f"📝 <b>{ticker} 설정 수정</b>\n\n"
-            f"- 현재 시드: <code>{cur['seed']}</code>\n"
-            f"- 현재 분할횟수: <code>{cur['total_a']}</code>\n"
-            f"- 목표수익률: <code>{auto_profit}</code>% (V{method} 자동 적용)\n"
-            f"- 방식(method): <code>{method}</code>{ot_line}\n\n"
-            f"⚠️ V{method}에서 {ticker}의 목표수익률은 <b>{auto_profit}%</b>로 자동 적용됩니다.\n\n"
-            "<b>1/2</b> 새 <b>시드</b>를 입력해 주세요. (예: <code>2000</code>)\n"
-            "또는 한 줄로 <code>시드 분할횟수</code> (예: <code>2000 40</code>)\n\n"
-            "취소하려면 <code>취소</code> 라고 입력하세요."
-        )
-    else:
-        msg = (
-            f"📝 <b>{ticker} 설정 수정</b>\n\n"
-            f"- 현재 시드: <code>{cur['seed']}</code>\n"
-            f"- 현재 분할횟수: <code>{cur['total_a']}</code>\n"
-            f"- 현재 목표수익률: <code>{cur['profit']}</code>%\n"
-            f"- 방식(method): <code>{cur.get('method', '2.2')}</code>{ot_line}\n\n"
-            "<b>1/3</b> 새 <b>시드</b>를 입력해 주세요. (예: <code>2000</code>)\n"
-            "또는 한 줄로 <code>시드 분할횟수 목표수익률</code> (예: <code>2000 40 10</code>)\n\n"
-            "취소하려면 <code>취소</code> 라고 입력하세요."
-        )
-    await query.edit_message_text(msg, parse_mode="HTML")
-
-
 CALLBACK_HANDLERS = {
-    "all": _cb_all,
-    "entry": _cb_entry,
-    "entryask": _cb_entryask,
-    "entrycycle": _cb_entrycycle,
-    "entryforce": _cb_entryforce,
-    "status_dive": _cb_status_dive,
-    "orders_day": _cb_orders_day,
-    "unfilled": _cb_unfilled,
-    "profit_dive": _cb_profit_dive,
-    "guide": _cb_guide,
-    "ask_del": _cb_ask_del,
-    "exec_del": _cb_exec_del,
-    "ask_liq": _cb_ask_liq,
-    "exec_liq": _cb_exec_liq,
-    "edit_pick": _cb_edit_pick,
+    "guide": _cb_guide, "html_report": _cb_html_report,
+    "m_plan": _cb_m_plan, "m_go": _cb_m_go, "m_force": _cb_m_force, "unfilled": _cb_unfilled,
+    "status_dive": _cb_status_dive, "orders_day": _cb_orders_day, "profit_dive": _cb_profit_dive,
+    "exec_reset": _cb_exec_reset, "edit_pick": _cb_edit_pick,
+    "ask_del": _cb_ask_del, "exec_del": _cb_exec_del, "ask_liq": _cb_ask_liq, "exec_liq": _cb_exec_liq,
     "cancel": _cb_cancel,
 }
 
@@ -1549,247 +646,53 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     parts = query.data.split(":")
-    action = parts[0]
-    ticker = parts[1] if len(parts) > 1 else ""
-
-    # 수동 주문(manual_order)에서는 잠금 안내 후 사용자가 선택한 주문을 허용합니다.
-    is_manual = action.startswith("m_")
-    if is_manual:
-        action = action[2:]
-
-    # trade_lock은 "오늘의 주문 전송" 중복만 막는 용도이므로, 실제 주문 액션에만 적용합니다.
-    if (not is_manual) and action in ("all", "entry") and ticker and utils.check_trade_lock(ticker):
-        unfilled = await asyncio.to_thread(kis_client.query_unfilled_orders_today_us, ticker)
-        lock_msg = f"⚠️ **{ticker}**는 이미 오늘 매매 지시가 전송되었습니다.\n\n"
-        if unfilled:
-            is_active = any(u["status"] == "대기" for u in unfilled)
-            if is_active:
-                lock_msg += "⏳ **증권사 대기 중인 주문 (미국 당일):**\n"
-                for u in unfilled:
-                    if u["status"] == "대기":
-                        lock_msg += f"• {u['side']} {u['qty']}주 @ ${u['price']:.2f} ({u['type']})\n"
-                lock_msg += "\n(💡 장 마감 시점에 가격 조건이 맞으면 체결됩니다.)"
-            else:
-                lock_msg += "❕ **체결되지 않고 종료된 주문 (미국 당일):**\n"
-                for u in unfilled:
-                    lock_msg += f"• {u['side']} {u['qty']}주 @ ${u['price']:.2f} ({u['type']}) - {u['status']}\n"
-                lock_msg += "\n(💡 지정가/LOC 조건이 맞지 않아 체결되지 않았습니다.)"
-        else:
-            lock_msg += "✅ 모든 주문이 이미 체결된 상태입니다."
-        await query.edit_message_text(lock_msg, parse_mode="Markdown")
-        return
-
-    handler = CALLBACK_HANDLERS.get(action)
+    handler = CALLBACK_HANDLERS.get(parts[0])
     if handler:
         await handler(update, context, query, parts)
 
 
-
-
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # edit_target 단계형 워크플로우 입력 처리
-    pending = context.user_data.get("pending_edit_target")
-    if pending and update and getattr(update, "message", None) and getattr(update.message, "text", None):
-        text = update.message.text.strip()
-        if text in ("취소", "cancel", "/cancel"):
-            context.user_data.pop("pending_edit_target", None)
-            await update.message.reply_text("✅ 설정 수정이 취소되었습니다.")
-            return
+    text = (update.message.text or "") if update.message else ""
+    if text.startswith("/"):
+        await update.message.reply_text("알 수 없는 명령어입니다. /help 에서 전체 명령어를 확인하세요.",
+                                        reply_markup=main_reply_keyboard_markup())
 
-        def _validate(seed_v, total_a_v, profit_v):
-            if seed_v <= 0:
-                return "❌ 시드는 0보다 커야 합니다."
-            if int(total_a_v) != total_a_v:
-                return "❌ 분할횟수는 정수여야 합니다. (예: 40)"
-            if total_a_v < 1 or total_a_v > 300:
-                return "❌ 분할횟수는 1~300 범위에서 입력해 주세요."
-            if profit_v <= 0 or profit_v > 200:
-                return "❌ 목표수익률은 0보다 크고 200(%) 이하여야 합니다."
-            return ""
-
-        parts = text.split()
-        auto_profit = pending.get("auto_profit")
-
-        # 한 줄 입력: V3.0/V4.0 자동수익률 종목은 2개, 그 외 3개
-        if auto_profit is not None and len(parts) == 2:
-            try:
-                seed = float(parts[0])
-                total_a = float(parts[1])
-            except ValueError:
-                await update.message.reply_text("❌ 숫자 입력이 올바르지 않습니다. 예: 2000 40")
-                return
-            profit = auto_profit
-            err = _validate(seed, total_a, profit)
-            if err:
-                await update.message.reply_text(err)
-                return
-            pending["seed"] = seed
-            pending["total_a"] = int(total_a)
-            pending["profit"] = profit
-            pending["stage"] = "done"
-        elif len(parts) == 3:
-            try:
-                seed = float(parts[0])
-                total_a = float(parts[1])
-                profit = float(parts[2])
-            except ValueError:
-                await update.message.reply_text("❌ 숫자 입력이 올바르지 않습니다. 예: 2000 40 10")
-                return
-            # V3.0/V4.0 자동수익률 종목이면 사용자 입력 무시, 하드코딩 적용
-            if auto_profit is not None:
-                profit = auto_profit
-            err = _validate(seed, total_a, profit)
-            if err:
-                await update.message.reply_text(err)
-                return
-            pending["seed"] = seed
-            pending["total_a"] = int(total_a)
-            pending["profit"] = profit
-            pending["stage"] = "done"
-        else:
-            stage = pending.get("stage", "seed")
-            # 단계형 입력: seed → split → (profit - V3.0/V4.0 자동적용 시 생략)
-            if stage == "seed":
-                try:
-                    seed = float(text)
-                except ValueError:
-                    await update.message.reply_text("❌ 새 시드를 숫자로 입력해 주세요. 예: 2000")
-                    return
-                if seed <= 0:
-                    await update.message.reply_text("❌ 시드는 0보다 커야 합니다.")
-                    return
-                pending["seed"] = seed
-                pending["stage"] = "split"
-                if auto_profit is not None:
-                    await update.message.reply_text("✅ 2/2 새 <b>분할횟수</b>(정수)를 입력해 주세요. 예: <code>40</code>", parse_mode="HTML")
-                else:
-                    await update.message.reply_text("✅ 2/3 새 <b>분할횟수</b>(정수)를 입력해 주세요. 예: <code>40</code>", parse_mode="HTML")
-                return
-
-            if stage == "split":
-                try:
-                    total_a = float(text)
-                except ValueError:
-                    await update.message.reply_text("❌ 분할횟수는 정수로 입력해 주세요. 예: 40")
-                    return
-                if int(total_a) != total_a:
-                    await update.message.reply_text("❌ 분할횟수는 정수여야 합니다. 예: 40")
-                    return
-                total_a_i = int(total_a)
-                if total_a_i < 1 or total_a_i > 300:
-                    await update.message.reply_text("❌ 분할횟수는 1~300 범위에서 입력해 주세요.")
-                    return
-                pending["total_a"] = total_a_i
-
-                # V3.0/V4.0 자동수익률: profit 단계 건너뛰고 바로 완료
-                if auto_profit is not None:
-                    pending["profit"] = auto_profit
-                    pending["stage"] = "done"
-                else:
-                    pending["stage"] = "profit"
-                    await update.message.reply_text("✅ 3/3 새 <b>목표수익률(%)</b>을 입력해 주세요. 예: <code>10</code>", parse_mode="HTML")
-                    return
-
-            if stage == "profit":
-                try:
-                    profit = float(text)
-                except ValueError:
-                    await update.message.reply_text("❌ 목표수익률(%)은 숫자로 입력해 주세요. 예: 10")
-                    return
-                if profit <= 0 or profit > 200:
-                    await update.message.reply_text("❌ 목표수익률은 0보다 크고 200(%) 이하여야 합니다.")
-                    return
-                pending["profit"] = profit
-                pending["stage"] = "done"
-
-        if pending.get("stage") == "done":
-            ticker = pending.get("ticker")
-            seed = float(pending.get("seed"))
-            total_a = int(pending.get("total_a"))
-            profit = float(pending.get("profit"))
-            err = _validate(seed, float(total_a), profit)
-            if err:
-                await update.message.reply_text(err)
-                return
-
-            from config_manager import STRATEGY_SETTINGS, save_config
-            from state_manager import STRATEGY
-
-            if ticker not in STRATEGY:
-                context.user_data.pop("pending_edit_target", None)
-                await update.message.reply_text(f"❌ {ticker} 종목은 현재 투자 대상이 아닙니다.")
-                return
-
-            new_settings = dict(STRATEGY_SETTINGS)
-            merged = {**STRATEGY_SETTINGS.get(ticker, {}), "seed": seed, "total_a": total_a, "target_profit": profit}
-            new_settings[ticker] = merged
-            if save_config({"STRATEGY_SETTINGS": new_settings}):
-                STRATEGY[ticker] = _runtime_strategy_entry(ticker, merged)
-                context.user_data.pop("pending_edit_target", None)
-                await update.message.reply_text(
-                    f"✅ {ticker} 설정 변경 완료!\n- 시드: ${seed:,.0f}\n- 분할횟수: {total_a}회\n- 목표수익률: {profit}%\n- 방식: {STRATEGY[ticker]['method']} (method/one_time_usd 유지)",
-                )
-                return
-            await update.message.reply_text("❌ 설정 저장 실패")
-            return
-
-    if not _message_has_bot_command(update.message):
-        return
-
-    msg = (
-        "❓ **알 수 없는 명령어입니다.**\n\n"
-        "입력하신 내용을 이해하지 못했습니다. 아래 버튼을 눌러 명령을 실행하거나, `/help`를 입력해 전체 명령어 리스트를 확인해 주세요!"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_reply_keyboard_markup())
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
-    if err is not None:
-        tb = getattr(err, "__traceback__", None)
-        log.error(
-            "Telegram handler error: %s\n%s",
-            err,
-            "".join(traceback.format_exception(type(err), err, tb)),
-        )
-    else:
+    if err is None:
         log.error("Telegram handler error (no exception object)")
+        return
+    log.error("Telegram handler error: %s\n%s", err,
+              "".join(traceback.format_exception(type(err), err, getattr(err, "__traceback__", None))))
+
 
 async def post_init(application):
     """봇 초기화: 메뉴 명령어 등록, 스케줄 복원, 누락 정산 체크."""
-    # 순서: 도움말 -> 조회 -> 제어 -> 설정 -> 위험(청산). main.py COMMAND_HANDLERS와 동일한 분류.
-    commands = [
-        BotCommand("help", "📚 도움말"),
-        BotCommand("status", "📊 현황보기"),
-        BotCommand("cash", "💰 예수금확인"),
-        BotCommand("report", "📈 수익보고"),
-        BotCommand("profit_history", "📋 수익기록"),
-        BotCommand("logs", "📋 최근 24시간 로그"),
-        BotCommand("sync", "🔄 신규동기화"),
-        BotCommand("manual_order", "🧾 수동주문"),
-        BotCommand("add_target", "➕ 종목추가"),
-        BotCommand("edit_target", "📝 종목수정"),
-        BotCommand("del_target", "🗑️ 종목삭제"),
-        BotCommand("liquidate", "🚨 전량이익매도 및 종료"),
-    ]
-    await application.bot.set_my_commands(commands)
-    
-    # NotificationService에 실시간 봇 인스턴스 주입
+    await application.bot.set_my_commands([
+        BotCommand("help", "도움말"), BotCommand("status", "현황"), BotCommand("report", "HTML 리포트"),
+        BotCommand("cash", "예수금"), BotCommand("profit_history", "수익기록"), BotCommand("logs", "최근 24시간 로그"),
+        BotCommand("sync", "동기화와 체결 정산"), BotCommand("manual_order", "수동 주문"), BotCommand("set_t", "진행도 T 보정"),
+        BotCommand("add_target", "종목 추가"), BotCommand("edit_target", "종목 수정"), BotCommand("del_target", "종목 삭제"),
+        BotCommand("liquidate", "전량 매도 후 종료"),
+    ])
     notifier.set_bot(application.bot)
-    
-    chat_id = utils.load_chat_id()
-    if chat_id:
-        from scheduler import register_schedules, check_missed_settlement
-        register_schedules(application.job_queue, chat_id)
-        log.info("Registered schedules for chat_id=%s", chat_id)
-        
-        # 8시 리포트 누락 체크 (비동기로 실행)
-        def _log_missed_settlement_task(t: asyncio.Task) -> None:
-            try:
-                exc = t.exception()
-            except asyncio.CancelledError:
-                return
-            if exc is not None:
-                log.error("check_missed_settlement failed: %s", exc, exc_info=True)
 
-        _t = asyncio.create_task(check_missed_settlement(application))
-        _t.add_done_callback(_log_missed_settlement_task)
+    chat_id = utils.load_chat_id()
+    if not chat_id:
+        log.info("등록된 채팅이 없습니다. 텔레그램에서 /start 를 보내 주세요.")
+        return
+    from scheduler import check_missed_settlement, register_schedules
+    register_schedules(application.job_queue, chat_id)
+    log.info("Registered schedules for chat_id=%s", chat_id)
+
+    def _log_done(t: asyncio.Task) -> None:
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            log.error("check_missed_settlement failed: %s", exc, exc_info=True)
+
+    task = asyncio.create_task(check_missed_settlement(application))
+    task.add_done_callback(_log_done)

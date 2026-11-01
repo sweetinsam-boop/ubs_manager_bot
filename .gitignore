@@ -1,23 +1,30 @@
+# 비밀값은 절대 커밋하지 않는다 (견본 .env.example 만 올린다)
 .env
-.DS_Store
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+.env.*
+!.env.example
 
-# Local data and logs
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+
+# 런타임 상태·기록·로그
 logs/
-storage/
+storage/*
+!storage/__init__.py
+!storage/paths.py
+!storage/file_store.py
 tmp/
 scratch/
 *.dat
 *.json
-!requirements.txt
+!trading_settings.example.json
 
-# Reference documents and PDFs (excluded as per user request)
+# 참고 문서·이미지·메모 (README, requirements, 견본 설정만 올린다)
 *.pdf
 *.xlsx
+*.png
 *.md
 !README.md
 *.txt
-*.png
+!requirements.txt

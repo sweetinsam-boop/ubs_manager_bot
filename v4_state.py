@@ -1,13 +1,43 @@
-"""무한매수법 V4.0 전용 상태(T, 리버스모드). trading_settings와 별도 JSON으로 관리."""
+"""V4.0 종목별 상태: T, 잔금(pool), 리버스 여부, 아직 정산하지 않은 주문 기록.
+
+trading_settings.json(사용자 설정)과 별도 파일이며, 필드는 다음과 같다.
+  t                  현재 T (None이면 아직 시작 전 → 보유 원가로 추정)
+  pool               잔금: 원금 - 매수누적 + 매도회수 (달러)
+  reverse            소진 후 리버스모드 여부
+  reverse_started_ymd  리버스 진입일 (YYYY-MM-DD, 표시용)
+  reverse_day1_done  리버스 첫날 MOC 매도를 이미 냈는지
+  orders             정산 대기 주문 [{ymd, odno, kind, side, qty, price, half, settled}]
+"""
 from __future__ import annotations
 
+import threading
+from contextlib import contextmanager
 from typing import Any
 
 from storage.paths import get_path
 from storage.file_store import load_json, save_json
 
-# paths.py 구버전(상수 미정의)과도 호환되도록 파일명은 여기서 고정
 _V4_STATE_JSON = "v4_strategy_state.json"
+_MAX_ORDERS = 80
+_lock = threading.RLock()
+
+
+@contextmanager
+def locked():
+    """읽기-수정-쓰기 구간을 직렬화한다 (스케줄러 스레드와 텔레그램 명령 동시 접근 방어)."""
+    with _lock:
+        yield
+
+
+def _default_record() -> dict[str, Any]:
+    return {
+        "t": None,
+        "pool": None,
+        "reverse": False,
+        "reverse_started_ymd": None,
+        "reverse_day1_done": False,
+        "orders": [],
+    }
 
 
 def load_v4_state() -> dict[str, Any]:
@@ -18,158 +48,48 @@ def save_v4_state(data: dict[str, Any]) -> None:
     save_json(get_path(_V4_STATE_JSON), data, ensure_ascii=False, indent=2)
 
 
-def _default_record() -> dict[str, Any]:
-    return {
-        "t": None,
-        "reverse": False,
-        "reverse_started_ymd": None,
-        "pending_moc": None,
-        "reverse_sell_proceeds": 0.0,
-        "frozen_rem": 0.0,
-    }
+def _merge(raw: Any) -> dict[str, Any]:
+    rec = _default_record()
+    if isinstance(raw, dict):
+        # 구버전 필드(pending_moc, frozen_rem, reverse_sell_proceeds)는 버린다.
+        rec.update({k: v for k, v in raw.items() if k in rec})
+    if not isinstance(rec["orders"], list):
+        rec["orders"] = []
+    return rec
 
 
 def get_record(ticker: str) -> dict[str, Any]:
-    st = load_v4_state()
-    r = st.get(ticker)
-    if not isinstance(r, dict):
-        r = _default_record()
-    else:
-        r = {**_default_record(), **r}
-    return r
+    return _merge(load_v4_state().get(ticker))
 
 
-def put_record(ticker: str, **kwargs) -> None:
-    st = load_v4_state()
-    cur = st.get(ticker)
-    if not isinstance(cur, dict):
-        cur = _default_record()
-    else:
-        cur = {**_default_record(), **cur}
-    cur.update(kwargs)
-    st[ticker] = cur
-    save_v4_state(st)
-
-
-def ensure_t(ticker: str, s: dict, d: dict, t_seed: float) -> float:
-    """저장된 T가 없으면 t_seed로 초기화 후 저장."""
-    st = load_v4_state()
-    cur = st.get(ticker)
-    if not isinstance(cur, dict):
-        cur = _default_record()
-    else:
-        cur = {**_default_record(), **cur}
-    if cur.get("t") is None:
-        cur["t"] = float(t_seed)
+def put_record(ticker: str, **kwargs: Any) -> None:
+    with _lock:
+        st = load_v4_state()
+        cur = _merge(st.get(ticker))
+        cur.update(kwargs)
         st[ticker] = cur
         save_v4_state(st)
-        return float(t_seed)
-    return float(cur["t"])
 
 
-def set_t(ticker: str, t_val: float) -> None:
-    put_record(ticker, t=t_val)
+def add_order(ticker: str, order: dict[str, Any]) -> None:
+    with _lock:
+        rec = get_record(ticker)
+        put_record(ticker, orders=(rec["orders"] + [order])[-_MAX_ORDERS:])
 
 
-def multiply_t(ticker: str, factor: float) -> float:
-    st = load_v4_state()
-    cur = st.get(ticker)
-    if not isinstance(cur, dict):
-        cur = _default_record()
-    else:
-        cur = {**_default_record(), **cur}
-    nt = float(cur.get("t") or 0.0) * float(factor)
-    cur["t"] = nt
-    st[ticker] = cur
-    save_v4_state(st)
-    return nt
-
-
-def add_t_delta(ticker: str, delta: float) -> float:
-    st = load_v4_state()
-    cur = st.get(ticker)
-    if not isinstance(cur, dict):
-        cur = _default_record()
-    else:
-        cur = {**_default_record(), **cur}
-    nt = float(cur.get("t") or 0.0) + float(delta)
-    cur["t"] = nt
-    st[ticker] = cur
-    save_v4_state(st)
-    return nt
-
-
-def enter_reverse(ticker: str, us_ymd: str, frozen_rem: float = 0.0) -> None:
-    put_record(
-        ticker,
-        reverse=True,
-        reverse_started_ymd=us_ymd,
-        reverse_sell_proceeds=0.0,
-        frozen_rem=float(frozen_rem),
-    )
-
-
-def exit_reverse(ticker: str) -> None:
-    put_record(
-        ticker,
-        reverse=False,
-        reverse_started_ymd=None,
-        reverse_sell_proceeds=0.0,
-        frozen_rem=0.0,
-    )
-
-def get_frozen_rem(ticker: str) -> float:
-    """리버스 진입 시 굳어진 가상의 잔여 시드 현금"""
-    return float(get_record(ticker).get("frozen_rem") or 0.0)
-
-def is_reverse(ticker: str) -> bool:
-    return bool(get_record(ticker).get("reverse"))
-
-
-def reverse_start_ymd(ticker: str) -> str | None:
-    v = get_record(ticker).get("reverse_started_ymd")
-    return str(v) if v else None
-
-
-def get_pending_moc(ticker: str) -> dict[str, Any] | None:
-    pm = get_record(ticker).get("pending_moc")
-    return pm if isinstance(pm, dict) else None
-
-
-def set_pending_moc(ticker: str, odno: str, min_qty: int, mult: float) -> None:
-    put_record(
-        ticker,
-        pending_moc={"odno": str(odno), "min_qty": int(min_qty), "mult": float(mult)},
-    )
-
-
-def clear_pending_moc(ticker: str) -> None:
-    put_record(ticker, pending_moc=None)
-
-
-def get_reverse_sell_proceeds(ticker: str) -> float:
-    """리버스모드 중 누적된 매도 회수금(달러)."""
-    return float(get_record(ticker).get("reverse_sell_proceeds") or 0.0)
-
-
-def add_reverse_sell_proceeds(ticker: str, amount: float) -> float:
-    """리버스모드 매도 체결 금액을 누적. 반환값: 누적 합계."""
-    st = load_v4_state()
-    cur = st.get(ticker)
-    if not isinstance(cur, dict):
-        cur = _default_record()
-    else:
-        cur = {**_default_record(), **cur}
-    prev = float(cur.get("reverse_sell_proceeds") or 0.0)
-    cur["reverse_sell_proceeds"] = prev + float(amount)
-    st[ticker] = cur
-    save_v4_state(st)
-    return cur["reverse_sell_proceeds"]
+def reset_record(ticker: str) -> None:
+    """사이클 종료(전량 매도) 후 초기화."""
+    with _lock:
+        st = load_v4_state()
+        st[ticker] = _default_record()
+        save_v4_state(st)
 
 
 def delete_record(ticker: str) -> None:
-    """해당 종목의 V4 상태 기록을 완전히 제거합니다."""
-    st = load_v4_state()
-    if ticker in st:
-        del st[ticker]
-        save_v4_state(st)
+    with _lock:
+        st = load_v4_state()
+        if ticker in st:
+            del st[ticker]
+            save_v4_state(st)
+
+

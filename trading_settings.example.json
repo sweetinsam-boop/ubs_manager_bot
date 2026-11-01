@@ -1,0 +1,7 @@
+{
+    "POST_CLOSE_SYNC_NY": "16:40",
+    "STRATEGY_SETTINGS": {
+        "TQQQ": {"seed": 4000.0, "total_a": 20, "target_profit": 15.0},
+        "SOXL": {"seed": 2000.0, "total_a": 20, "target_profit": 20.0}
+    }
+}

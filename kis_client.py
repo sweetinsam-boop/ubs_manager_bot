@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover
 
 URL_BASE = "https://openapi.koreainvestment.com:9443"
 log = get_logger(__name__)
-# 프로젝트 루트 기준 절대 경로 (Docker/호스트 동일 동작)
+# storage/ 기준 절대 경로 (Docker/호스트 동일 동작)
 TOKEN_FILE = str(get_path(_TOKEN_FILE_NAME))
 
 # 토큰 파일 접근 직렬화 (스케줄러 자동 실행과 텔레그램 수동 명령의 동시 호출 방어)
@@ -347,7 +347,6 @@ def get_exchange_rate():
         log.warning("환율 조회 실패: %s", e)
         return 0.0, "N/A"
 
-EXCHANGE_CODE = {} # 빈 사전으로 시작하여 get_exchange_code에서 동적으로 채워짐
 
 def get_exchange_code(ticker):
     """
@@ -475,7 +474,6 @@ def cancel_order(ticker, order_no, qty, max_retries=2):
                 continue
             return {"rt_cd": "-1", "msg1": f"통신오류: {str(e)}"}
 
-PRICE_EXCHANGE_CODE = {} # get_price_exchange_code에서 동적으로 채워짐
 
 def get_price_exchange_code(ticker):
     """
@@ -586,7 +584,8 @@ def get_prev_close(ticker):
     return 0.0
 
 def get_avg_close_last_n_days(ticker: str, n: int = 5) -> float:
-    """최근 n거래일 종가 평균(V4.0 리버스 별지점). 실패 시 0."""
+    """직전 n거래일 종가 평균(V4.0 리버스 별지점). 장중에는 오늘의 미완성 봉을 제외한다. 실패 시 0."""
+    import pytz
     import yfinance as yf
     if n < 1:
         return 0.0
@@ -595,6 +594,9 @@ def get_avg_close_last_n_days(ticker: str, n: int = 5) -> float:
         hist = stock.history(period=f"{max(n, 5) + 5}d")
         if hist is None or hist.empty:
             return 0.0
+        now_ny = datetime.datetime.now(pytz.timezone("America/New_York"))
+        if hist.index[-1].date() == now_ny.date() and now_ny.hour < 16:
+            hist = hist.iloc[:-1]  # 오늘 봉은 아직 종가가 아니다
         closes = hist["Close"].dropna().iloc[-n:]
         if closes.empty:
             return 0.0
@@ -711,46 +713,6 @@ def query_ccnl_collect_all_pages_multi_excg(
     )
 
 
-def ccnl_daily_signed_notional_dataframe(
-    strategy_tickers: list[str],
-    start_ymd: str,
-    end_ymd: str,
-) -> object | None:
-    """
-    체결내역 기준 일별 달러 증감(매수 체결은 음수, 매도 체결은 양수, 수량×체결가 합산).
-    MCP 문서 기준 NASD 1회 조회로 미국 전체 체결을 수집합니다.
-    """
-    import pandas as pd
-
-    rec = []
-    for t in strategy_tickers:
-        t = str(t).strip().upper()
-        if not t:
-            continue
-        rows = query_ccnl_collect_all_pages(t, "NASD", start_ymd, end_ymd, ccld_dvsn="01", max_pages=40)
-        for o in rows:
-            try:
-                d = _kis_parse_ymd_to_date(o.get("ord_dt"))
-                if not d:
-                    continue
-                qty = float(o.get("ft_ccld_qty", 0) or 0)
-                if qty <= 0:
-                    continue
-                px = float(o.get("ft_ccld_unpr3", o.get("ft_ccld_unpr", 0)) or 0)
-                side = str(o.get("sll_buy_dvsn_cd", "") or "").strip()
-                amt = qty * px
-                if side == "02":
-                    flow = -abs(amt)
-                else:
-                    flow = abs(amt)
-                rec.append({"date": pd.Timestamp(d), "ticker": t, "flow": flow})
-            except Exception:
-                continue
-    if not rec:
-        return None
-    df = pd.DataFrame(rec)
-    df = df.groupby(["date", "ticker"], as_index=False)["flow"].sum()
-    return df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
 
 def query_ccnl_for_report(excg_list=None, days_back=3, max_pages=2):
@@ -840,187 +802,55 @@ def query_recent_orders(ticker: str, days_back: int = 5, max_pages: int = 3):
     return out
 
 
-def check_order_filled(order_no, ticker, side="SELL", max_checks=10, interval=3):
-    """특정 주문 번호에 대해 체결 여부를 확인합니다."""
+def fills_by_order(ticker: str, days_back: int = 10, max_pages: int = 6) -> dict[str, tuple[int, float]] | None:
+    """
+    주문번호 → (누적 체결수량, 체결금액 $). 조회 자체가 실패하면 None (미체결과 구분하기 위함).
+    부분체결 행이 여러 줄이면 누적수량 증가분 × 해당 행 체결가로 합산한다.
+    """
+    import pytz
+
+    now_ny = datetime.datetime.now(pytz.timezone("America/New_York"))
+    end_dt = now_ny.strftime("%Y%m%d")
+    start_dt = (now_ny - datetime.timedelta(days=days_back)).strftime("%Y%m%d")
     excg = get_exchange_code(ticker)
-    want = str(order_no or "").strip()
-    for i in range(max_checks):
-        res = query_ccnl_raw(ticker=ticker, excg=excg, ccld_dvsn="01") # 01: 체결만
-        if res.get('rt_cd') == '0':
-            for o in res.get('output', []):
-                od = str(o.get("odno", "") or "").strip()
-                og = str(o.get("orgn_odno", "") or "").strip()
-                if od == want or og == want:
-                    ccld_qty = int(float(o.get('ft_ccld_qty', '0')))
-                    if ccld_qty > 0:
-                        ccld_unpr = float(o.get('ft_ccld_unpr3', o.get('ft_ccld_unpr', '0')))
-                        return True, ccld_qty, ccld_unpr
-        import time
-        time.sleep(interval)
-    return False, 0, 0
+    rows, nk, fk, tr_cont = [], "", "", ""
+    for page in range(max_pages):
+        res = query_ccnl_raw(ticker=ticker, excg=excg, start_dt=start_dt, end_dt=end_dt,
+                             ccld_dvsn="00", ctx_nk200=nk, ctx_fk200=fk, tr_cont=tr_cont)
+        if res.get("rt_cd") != "0":
+            if page == 0:
+                return None
+            break
+        rows.extend(res.get("output", []) or [])
+        nk, fk = res.get("ctx_area_nk200", "") or "", res.get("ctx_area_fk200", "") or ""
+        if (res.get("tr_cont") or "").strip() not in ("M", "F"):
+            break
+        tr_cont = "N"
 
-
-def collect_recent_buy_odnos_with_fill(ticker: str, days_back: int = 14, max_pages: int = 8) -> list[str]:
-    """최근 체결 있는 매수 주문번호 목록(중복 제거, 대략 시간순)."""
-    try:
-        rows = query_recent_orders(ticker, days_back=days_back, max_pages=max_pages)
-    except Exception:
-        return []
-    out: list[str] = []
-    seen: set[str] = set()
-    for o in rows or []:
-        if str(o.get("sll_buy_dvsn_cd", "") or "").strip() != "02":
-            continue
+    out: dict[str, tuple[int, float]] = {}
+    for o in sorted(rows, key=lambda r: (str(r.get("ord_dt", "")), str(r.get("ord_tmd", "")))):
         try:
             q = int(float(o.get("ft_ccld_qty", 0) or 0))
+            px = float(o.get("ft_ccld_unpr3", o.get("ft_ccld_unpr", 0)) or 0)
         except (TypeError, ValueError):
-            q = 0
-        if q <= 0:
             continue
-        od = str(o.get("odno", "") or "").strip()
-        if od and od not in seen:
-            seen.add(od)
-            out.append(od)
+        for key in {str(o.get("odno", "") or "").strip(), str(o.get("orgn_odno", "") or "").strip()} - {""}:
+            last_q, total = out.get(key, (0, 0.0))
+            if q > last_q:
+                out[key] = (q, total + (q - last_q) * px)
     return out
 
 
-def sum_buy_notional_for_order(order_no: str, ticker: str) -> float:
-    """
-    해당 주문번호(odno/orgn_odno) 매수 체결분의 대략 매수금액 합(달러).
-    부분체결 행이 여러 줄이면 누적 수량 증가분 × 해당 행 체결가로 가산.
-    """
-    on = str(order_no or "").strip()
-    if not on:
-        return 0.0
-    try:
-        rows = query_recent_orders(ticker, days_back=14, max_pages=8)
-    except Exception:
-        return 0.0
-    matching = []
-    for o in rows or []:
-        if str(o.get("sll_buy_dvsn_cd", "") or "").strip() != "02":
-            continue
-        od = str(o.get("odno", "") or "").strip()
-        og = str(o.get("orgn_odno", "") or "").strip()
-        if od != on and og != on:
-            continue
-        matching.append(o)
-    if not matching:
-        return 0.0
-
-    def _row_key(o):
-        return (str(o.get("ord_dt", "") or ""), str(o.get("ord_tmd", "") or ""))
-
-    matching.sort(key=_row_key)
-    last_qty = 0
-    total = 0.0
-    for o in matching:
-        try:
-            q = int(float(o.get("ft_ccld_qty", 0) or 0))
-        except (TypeError, ValueError):
-            q = 0
-        if q <= last_qty:
-            continue
-        dq = q - last_qty
-        try:
-            px = float(o.get("ft_ccld_unpr3", o.get("ft_ccld_unpr", 0)) or 0)
-        except (TypeError, ValueError):
-            px = 0.0
-        total += dq * px
-        last_qty = q
-    return total
 
 
-def sum_sell_notional_for_order(order_no: str, ticker: str) -> float:
-    """
-    해당 주문번호(odno/orgn_odno) 매도 체결분의 대략 매도금액 합(달러).
-    sum_buy_notional_for_order와 동일 로직, 매도(sll_buy_dvsn_cd=="01") 전용.
-    """
-    on = str(order_no or "").strip()
-    if not on:
-        return 0.0
-    try:
-        rows = query_recent_orders(ticker, days_back=14, max_pages=8)
-    except Exception:
-        return 0.0
-    matching = []
-    for o in rows or []:
-        if str(o.get("sll_buy_dvsn_cd", "") or "").strip() != "01":
-            continue
-        od = str(o.get("odno", "") or "").strip()
-        og = str(o.get("orgn_odno", "") or "").strip()
-        if od != on and og != on:
-            continue
-        matching.append(o)
-    if not matching:
-        return 0.0
-
-    def _row_key(o):
-        return (str(o.get("ord_dt", "") or ""), str(o.get("ord_tmd", "") or ""))
-
-    matching.sort(key=_row_key)
-    last_qty = 0
-    total = 0.0
-    for o in matching:
-        try:
-            q = int(float(o.get("ft_ccld_qty", 0) or 0))
-        except (TypeError, ValueError):
-            q = 0
-        if q <= last_qty:
-            continue
-        dq = q - last_qty
-        try:
-            px = float(o.get("ft_ccld_unpr3", o.get("ft_ccld_unpr", 0)) or 0)
-        except (TypeError, ValueError):
-            px = 0.0
-        total += dq * px
-        last_qty = q
-    return total
 
 
-def sum_ccld_qty_for_order(order_no: str, ticker: str) -> int:
-    """최근 주문/체결 조회에서 해당 주문번호(odno/orgn_odno)의 최대 누적 체결수량."""
-    on = str(order_no or "").strip()
-    if not on:
-        return 0
-    try:
-        rows = query_recent_orders(ticker, days_back=7, max_pages=6)
-    except Exception:
-        return 0
-    best = 0
-    for o in rows or []:
-        od = str(o.get("odno", "") or "").strip()
-        og = str(o.get("orgn_odno", "") or "").strip()
-        if od != on and og != on:
-            continue
-        try:
-            cq = int(float(o.get("ft_ccld_qty", 0) or 0))
-            if cq > best:
-                best = cq
-        except Exception:
-            pass
-    return best
 
 
-def wait_order_min_filled(
-    order_no: str,
-    ticker: str,
-    min_qty: int,
-    max_checks: int = 36,
-    interval: int = 5,
-) -> tuple[bool, int]:
-    """min_qty 이상 체결될 때까지 폴링. (성공여부, 최종 누적 체결수량)."""
-    import time
-    on = str(order_no or "").strip()
-    if not on or min_qty <= 0:
-        return False, 0
-    last = 0
-    for _ in range(max_checks):
-        last = sum_ccld_qty_for_order(on, ticker)
-        if last >= min_qty:
-            return True, last
-        time.sleep(interval)
-    return False, last
+
+
+
+
 
 def _rows_to_unfilled_entries(rows):
     """체결내역 API output 행들에서 미체결 항목만 추출."""
@@ -1154,18 +984,6 @@ def query_unfilled_orders_today_us(ticker: str) -> list:
     return unique_orders
 
 
-def query_executions(ticker, date_str=None):
-    """특정 종목의 특정 날짜(또는 최근) 체결 내역이 있는지 확인합니다."""
-    excg = get_exchange_code(ticker)
-    res = query_ccnl_raw(ticker=ticker, excg=excg, start_dt=date_str, end_dt=date_str, ccld_dvsn="01")
-    if res.get('rt_cd') == '0':
-        for o in res.get('output', []):
-            try:
-                ccld_qty = int(float(o.get('ft_ccld_qty', '0')))
-                if ccld_qty > 0:
-                    return True
-            except Exception: pass
-    return False
 
 
 def _flatten_kis_output_blocks(res: dict) -> list:
@@ -1250,68 +1068,6 @@ def query_period_profit_all_rows(
     return rows
 
 
-def query_period_trans_all_rows(
-    erlm_strt_dt: str,
-    erlm_end_dt: str,
-    ovrs_excg_cd: str,
-    pdno: str = "",
-    sll_buy_dvsn_cd: str = "00",
-    loan_dvsn_cd: str = "",
-    max_pages: int = 30,
-) -> list:
-    """
-    해외주식 일별거래내역 API (문서 해외주식-063, inquire-period-trans, 실전 TR CTOS4001R).
-    증권사 HTS 일별 잔고·거래 흐름에 가까운 데이터(필드는 응답 기준 파싱).
-    """
-    token = get_kis_access_token()
-    if not token:
-        return []
-    url = f"{URL_BASE}/uapi/overseas-stock/v1/trading/inquire-period-trans"
-    base_headers = {
-        "Content-Type": "application/json",
-        "authorization": f"Bearer {token}",
-        "appkey": APP_KEY,
-        "appsecret": APP_SECRET,
-        "tr_id": "CTOS4001R",
-        "custtype": "P",
-    }
-    rows = []
-    nk, fk = "", ""
-    tr_cont = ""
-    for _ in range(max_pages):
-        headers = dict(base_headers)
-        if tr_cont:
-            headers["tr_cont"] = tr_cont
-        params = {
-            "CANO": CANO,
-            "ACNT_PRDT_CD": ACNT_PRDT_CD,
-            "ERLM_STRT_DT": erlm_strt_dt,
-            "ERLM_END_DT": erlm_end_dt,
-            "OVRS_EXCG_CD": ovrs_excg_cd,
-            "PDNO": pdno,
-            "SLL_BUY_DVSN_CD": sll_buy_dvsn_cd,
-            "LOAN_DVSN_CD": loan_dvsn_cd,
-            "CTX_AREA_NK100": nk,
-            "CTX_AREA_FK100": fk,
-        }
-        res = kis_api_call("GET", url, headers, params=params)
-        if res.get("rt_cd") != "0":
-            log.warning(
-                "period-trans rt_cd=%s msg=%s exc=%s",
-                res.get("rt_cd"),
-                (res.get("msg1") or "")[:120],
-                ovrs_excg_cd,
-            )
-            break
-        rows.extend(_flatten_kis_output_blocks(res))
-        nk = res.get("ctx_area_nk100", "") or ""
-        fk = res.get("ctx_area_fk100", "") or ""
-        cont = (res.get("tr_cont") or "").strip()
-        if cont in ("M", "F"):
-            tr_cont = "N"
-        else:
-            break
-    return rows
 
 
 def _kis_parse_ymd_to_date(val) -> datetime.date | None:
@@ -1396,25 +1152,6 @@ def _kis_row_day_flow_usd(row: dict) -> float:
     return best
 
 
-def _kis_row_trade_date(row: dict) -> datetime.date | None:
-    for k in (
-        "stlm_dt",
-        "stlm_date",
-        "trad_dt",
-        "tr_dt",
-        "erlm_dt",
-        "ord_dt",
-        "ovrs_stlm_dt",
-        "deal_dt",
-        "cntg_dt",
-        "ccld_dt",
-        "frm_dt",
-        "trde_dt",
-    ):
-        d = _kis_parse_ymd_to_date(row.get(k))
-        if d:
-            return d
-    return None
 
 
 def _kis_row_account_ledger_date(row: dict) -> datetime.date | None:
@@ -1465,34 +1202,10 @@ def _dedupe_period_profit_rows(rows: list) -> list:
     return list(by_key.values())
 
 
-def collect_strategy_exchange_codes(strategy_tickers: list[str]) -> list[str]:
-    ex = set()
-    for t in strategy_tickers:
-        ex.add(get_exchange_code(t))
-    return sorted(ex)
 
 
-def _nyse_open_dates_between(start_d: datetime.date, end_d: datetime.date) -> set:
-    """NYSE 개장일(현지 영업일) 집합. 주말·휴장일 제외."""
-    import pandas as pd
-    import pandas_market_calendars as mcal
-
-    if start_d > end_d:
-        return set()
-    cal = mcal.get_calendar("NYSE")
-    sched = cal.schedule(start_date=start_d, end_date=end_d)
-    if sched is None or sched.empty:
-        return set()
-    return {pd.Timestamp(ts).date() for ts in sched.index}
 
 
-def nyse_open_dates_sorted(start_ymd: str, end_ymd: str) -> list:
-    """NYSE 거래일 리스트(정렬). 차트 리인덱스·공백 방지용."""
-    start_d = _kis_parse_ymd_to_date(start_ymd)
-    end_d = _kis_parse_ymd_to_date(end_ymd)
-    if not start_d or not end_d:
-        return []
-    return sorted(_nyse_open_dates_between(start_d, end_d))
 
 
 def account_daily_pnl_dataframe(start_ymd: str, end_ymd: str) -> tuple[object | None, str]:
@@ -1545,104 +1258,3 @@ def account_daily_pnl_dataframe(start_ymd: str, end_ymd: str) -> tuple[object | 
     return df.reset_index(drop=True), note + f" | 일자={len(df)}"
 
 
-def broker_daily_flow_dataframe(
-    strategy_tickers: list[str],
-    start_ymd: str,
-    end_ymd: str,
-) -> tuple[object | None, str]:
-    """
-    (date, ticker, flow) 일별 흐름.
-    1) 해외주식 기간손익: ovrs_excg_cd="" 공란 1회 호출로 미국 전체 조회
-    2) 금액이 전부 0이면 일별거래내역 → 체결내역(CCNL, NASD 1회·중복 제거)
-    3) NYSE 영업일만 남기고, 거래/응답이 없는 날은 행을 만들지 않음(주말에 0으로 채우지 않음)
-    """
-    import pandas as pd
-
-    tick_order = [str(t).strip().upper() for t in strategy_tickers if str(t).strip()]
-    tick_set = set(tick_order)
-    if not tick_set:
-        return None, "no tickers"
-
-    start_d = _kis_parse_ymd_to_date(start_ymd)
-    end_d = _kis_parse_ymd_to_date(end_ymd)
-    if not start_d or not end_d:
-        return None, "bad date range"
-
-    def build_kis_records(rows: list[dict]) -> list[dict]:
-        rec = []
-        for row in rows:
-            sym = _kis_row_ticker(row)
-            if not sym or sym not in tick_set:
-                continue
-            d = _kis_row_account_ledger_date(row) or _kis_row_trade_date(row)
-            if d is None:
-                continue
-            fl = _kis_row_day_flow_usd(row)
-            rec.append({"date": pd.Timestamp(d), "ticker": sym, "flow": fl})
-        return rec
-
-    all_rows = query_period_profit_all_rows(start_ymd, end_ymd, "", pdno="", max_pages=22)
-
-    deduped = _dedupe_period_profit_rows(all_rows)
-    rec_kis = build_kis_records(deduped)
-    note_parts = [f"기간손익 원시행={len(all_rows)} dedupe={len(deduped)} 파싱행={len(rec_kis)}"]
-
-    df_kis = None
-    if rec_kis:
-        df_kis = pd.DataFrame(rec_kis)
-        df_kis = df_kis.groupby(["date", "ticker"], as_index=False)["flow"].sum()
-
-    df_trans = None
-    if df_kis is None or df_kis.empty:
-        trans_rows = query_period_trans_all_rows(start_ymd, end_ymd, "", pdno="", max_pages=22)
-        rec_t = build_kis_records(trans_rows)
-        note_parts.append(f"일별거래 원시={len(trans_rows)} 파싱={len(rec_t)}")
-        if rec_t:
-            df_trans = pd.DataFrame(rec_t)
-            df_trans = df_trans.groupby(["date", "ticker"], as_index=False)["flow"].sum()
-
-    df_ccnl = ccnl_daily_signed_notional_dataframe(tick_order, start_ymd, end_ymd)
-    if df_ccnl is not None and not df_ccnl.empty:
-        note_parts.append(f"체결내역 일별행={len(df_ccnl)}")
-
-    def kis_usable(df) -> bool:
-        return df is not None and not df.empty and float(df["flow"].abs().sum()) >= 1e-9
-
-    if kis_usable(df_kis):
-        df_m = df_kis.copy()
-        src = "기간손익 API"
-        if df_ccnl is not None and not df_ccnl.empty:
-            for t in tick_order:
-                sub = df_m[df_m["ticker"] == t]
-                missing_or_zero = sub.empty or float(sub["flow"].abs().sum()) < 1e-9
-                chunk = df_ccnl[df_ccnl["ticker"] == t]
-                if missing_or_zero and not chunk.empty:
-                    df_m = df_m[df_m["ticker"] != t]
-                    df_m = pd.concat([df_m, chunk], ignore_index=True)
-            df_m = df_m.groupby(["date", "ticker"], as_index=False)["flow"].sum()
-    elif df_trans is not None and kis_usable(df_trans):
-        df_m = df_trans
-        src = "일별거래내역 API"
-    elif df_ccnl is not None and not df_ccnl.empty:
-        df_m = df_ccnl
-        src = "체결내역(매수(-)·매도(+), 달러)"
-    else:
-        df_m = df_kis
-        src = "기간손익(데이터 없음/0)"
-
-    if df_m is None or df_m.empty:
-        return None, "; ".join(note_parts)
-
-    df_m = df_m.copy()
-    df_m["date"] = pd.to_datetime(df_m["date"]).dt.normalize()
-    open_dates = _nyse_open_dates_between(start_d, end_d)
-    df_m["_cd"] = df_m["date"].dt.date
-    df_in_nyse = df_m[df_m["_cd"].isin(open_dates)]
-    if df_in_nyse.empty:
-        df_out = df_m.drop(columns=["_cd"])
-    else:
-        df_out = df_in_nyse.drop(columns=["_cd"])
-
-    df_out["ticker"] = pd.Categorical(df_out["ticker"], categories=tick_order, ordered=True)
-    df_out = df_out.sort_values(["ticker", "date"]).reset_index(drop=True)
-    return df_out, "; ".join(note_parts) + f" | 사용={src}"

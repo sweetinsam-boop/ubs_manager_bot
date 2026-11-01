@@ -169,5 +169,3 @@ def read_recent_log_text(
     return body, truncated
 
 
-def log_file_dir() -> Path:
-    return get_path(LOG_DIR)

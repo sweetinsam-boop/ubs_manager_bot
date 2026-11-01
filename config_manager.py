@@ -1,5 +1,5 @@
 """
-앱/증권 설정 로딩 및 저장.
+앱/증권 설정 로딩 및 저장 (.env 비밀값 + trading_settings.json 종목 설정).
 설정 파일 경로와 JSON I/O는 storage 모듈을 사용합니다.
 """
 from __future__ import annotations
@@ -15,16 +15,6 @@ load_dotenv()
 
 log = get_logger(__name__)
 
-
-def load_config():
-    """더 이상 JSON 설정 파일 대신 환경변수를 사용합니다."""
-    return {
-        "TELEGRAM_TOKEN": os.environ.get("TELEGRAM_TOKEN"),
-        "APP_KEY": os.environ.get("APP_KEY"),
-        "APP_SECRET": os.environ.get("APP_SECRET"),
-        "CANO": os.environ.get("CANO", ""),
-        "ACNT_PRDT_CD": os.environ.get("ACNT_PRDT_CD", "")
-    }
 
 # [Fail-Safe] 만약 storage/trading_settings.json 이 존재하지 않는데 루트에 존재한다면 복사해옵니다.
 settings_path = get_path(TRADING_SETTINGS_FILE)
