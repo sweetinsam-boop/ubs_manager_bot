@@ -7,23 +7,24 @@ STRATEGY[티커] = {seed, total_a, target_profit, data:{avg, qty, cumul}}
   data          증권사 잔고 기준 평단·수량·보유원가 (sync_account가 채움)
 """
 from config_manager import STRATEGY_SETTINGS
+from v4_rules import default_pct
 
 CURRENT_CASH = 0.0
 STRATEGY = {}
 
 
-def make_entry(sv: dict, data: dict | None = None) -> dict:
-    """trading_settings.json의 종목 설정 → 런타임 엔트리."""
+def make_entry(ticker: str, sv: dict, data: dict | None = None) -> dict:
+    """trading_settings.json의 종목 설정 → 런타임 엔트리. 익절 %가 없으면 공식 기본값(TQQQ 15, SOXL 20, 그 외 10)."""
     return {
         "seed": float(sv.get("seed", 0.0)),
         "total_a": float(sv.get("total_a", 20.0)),
-        "target_profit": float(sv.get("target_profit", 10.0)),
+        "target_profit": float(sv.get("target_profit") or default_pct(ticker)),
         "data": data if data is not None else {"avg": 0.0, "qty": 0.0, "cumul": 0.0},
     }
 
 
 for _ticker, _sv in STRATEGY_SETTINGS.items():
-    STRATEGY[_ticker] = make_entry(_sv)
+    STRATEGY[_ticker] = make_entry(_ticker, _sv)
 
 
 def sync_account():

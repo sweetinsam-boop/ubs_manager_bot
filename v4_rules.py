@@ -24,12 +24,17 @@ SELL_KINDS = ("sell_limit", "sell_quarter", "rev_moc", "rev_sell")
 BUY_KINDS = ("first", "avg", "star", "grid", "rev_buy", "rev_grid")
 
 
-def limit_pct(ticker: str, target_profit: float = 10.0) -> float:
-    """3/4 지정가 익절 목표%. TQQQ 15, SOXL 20, 그 외는 사용자 설정."""
-    return DEFAULT_LIMIT_PCT.get(str(ticker).upper(), float(target_profit))
+def default_pct(ticker: str) -> float:
+    """종목별 공식 기본 익절 목표%. TQQQ 15, SOXL 20, 그 외 10."""
+    return DEFAULT_LIMIT_PCT.get(str(ticker).upper(), 10.0)
 
 
-def star_pct(ticker: str, t: float, n: float, target_profit: float = 10.0) -> float:
+def limit_pct(ticker: str, target_profit: float | None = None) -> float:
+    """3/4 지정가 익절 목표%이자 별% 공식의 기준%. 사용자 설정이 있으면 그 값, 없으면 공식 기본값."""
+    return float(target_profit) if target_profit else default_pct(ticker)
+
+
+def star_pct(ticker: str, t: float, n: float, target_profit: float | None = None) -> float:
     base = limit_pct(ticker, target_profit)
     return base - (2.0 * base / n) * t
 
@@ -48,7 +53,7 @@ def reverse_mult(n: float) -> float:
     return 0.95 if n >= 30 else 0.9
 
 
-def reverse_exit_price(ticker: str, avg: float, target_profit: float = 10.0) -> float:
+def reverse_exit_price(ticker: str, avg: float, target_profit: float | None = None) -> float:
     """종가가 이 값보다 커지면 리버스 종료 (TQQQ 평단-15%, SOXL 평단-20%)."""
     return avg * (1 - limit_pct(ticker, target_profit) / 100.0)
 

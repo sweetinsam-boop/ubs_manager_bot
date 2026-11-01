@@ -30,6 +30,7 @@ COMMAND_HANDLERS = [
     ("sync", telegram_bot.cmd_sync),
     ("manual_order", telegram_bot.cmd_manual_order),
     ("set_t", telegram_bot.cmd_set_t),
+    ("set_profit", telegram_bot.cmd_set_profit),
     ("add_target", telegram_bot.cmd_add_target),
     ("edit_target", telegram_bot.cmd_edit_target),
     ("del_target", telegram_bot.cmd_del_target),

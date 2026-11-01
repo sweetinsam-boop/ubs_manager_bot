@@ -21,6 +21,7 @@ import report_html
 import state_manager
 import strategy
 import utils
+from v4_rules import default_pct
 from bot_logging import get_logger, read_recent_log_text
 from notification_service import notifier
 from state_manager import STRATEGY
@@ -112,6 +113,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>설정</b>\n"
         "/add_target 종목 원금 분할수 [수익%] 추가\n"
         "/edit_target 종목 원금 분할수 [수익%] 수정\n"
+        "/set_profit 종목 수익% 익절 목표만 변경 (진행 중에도 즉시 적용)\n"
         "/del_target 감시 중단 (주식은 팔지 않음)\n\n"
         "<b>긴급</b>\n"
         "/liquidate 전량 매도 후 종료, /profit_reset 누적 수익 기록 초기화\n\n"
@@ -482,7 +484,7 @@ def _parse_target_args(args: list[str], current: dict | None):
         return None, 0, 0, 0, "종목 코드는 영문 대문자 1~6자로 입력하세요."
     try:
         seed, n = float(args[1]), float(args[2])
-        target = float(args[3]) if len(args) > 3 else float((current or {}).get("target_profit", 10.0))
+        target = float(args[3]) if len(args) > 3 else float((current or {}).get("target_profit") or default_pct(ticker))
     except ValueError:
         return None, 0, 0, 0, "원금, 분할 수, 수익%는 숫자로 입력하세요."
     if seed <= 0:
@@ -496,7 +498,8 @@ def _parse_target_args(args: list[str], current: dict | None):
 
 def _target_usage(cmd: str) -> str:
     return (f"사용법: /{cmd} 종목 원금 분할수 [수익%]\n예: /{cmd} TQQQ 8000 20\n"
-            "TQQQ는 +15%, SOXL은 +20% 지정가 익절이 자동 적용됩니다. 그 외 종목은 수익%(기본 10)를 씁니다.\n"
+            "수익%는 지정가 익절 목표이자 별% 공식의 기준입니다. 생략하면 기본값(TQQQ 15, SOXL 20, 그 외 10)입니다.\n"
+            "진행 중에도 /set_profit 종목 수익% 로 바로 바꿀 수 있습니다.\n"
             "분할 수는 20 또는 40을 권장합니다. 공식 V4.0은 TQQQ와 SOXL만 다룹니다.")
 
 
@@ -516,10 +519,12 @@ async def _save_target(update, args, adding: bool):
     if not save_config({"STRATEGY_SETTINGS": new_settings}):
         await update.message.reply_text("설정 저장에 실패했습니다.")
         return
-    STRATEGY[ticker] = state_manager.make_entry(new_settings[ticker], STRATEGY.get(ticker, {}).get("data"))
+    STRATEGY[ticker] = state_manager.make_entry(ticker, new_settings[ticker], STRATEGY.get(ticker, {}).get("data"))
     note = "" if adding else "\n진행 중인 사이클의 T와 잔금은 그대로입니다. 필요하면 /set_t 로 보정하세요."
     if ticker not in ("TQQQ", "SOXL"):
         note += "\nTQQQ와 SOXL 외 종목은 공식 방법론의 검증 대상이 아닙니다."
+    if target != default_pct(ticker):
+        note += f"\n공식 기본값({default_pct(ticker):g}%)과 다른 값을 쓰고 있습니다."
     await update.message.reply_text(
         f"{ticker} 설정을 {'추가' if adding else '수정'}했습니다.\n원금 ${seed:,.0f}, {n}분할, 1회 ${seed / n:,.0f}, "
         f"지정가 익절 +{strategy.profit_target_pct(ticker):g}%{note}")
@@ -545,6 +550,35 @@ async def _cb_edit_pick(update, context, query, parts):
     await query.edit_message_text(
         f"{parts[1]} 현재 원금 ${s['seed']:,.0f}, {s['total_a']:g}분할.\n"
         f"이 형식으로 보내세요: /edit_target {parts[1]} {s['seed']:g} {s['total_a']:g}")
+
+
+async def cmd_set_profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """진행 중인 사이클에서도 익절 목표%(별% 기준 겸용)만 바로 바꾼다. T와 잔금은 그대로다."""
+    args = context.args
+    if len(args) != 2 or args[0].upper() not in STRATEGY:
+        await update.message.reply_text(
+            "사용법: /set_profit 종목 수익%\n예: /set_profit TQQQ 12\n등록 종목: " + ", ".join(STRATEGY))
+        return
+    ticker = args[0].upper()
+    try:
+        pct = float(args[1])
+    except ValueError:
+        pct = 0.0
+    if not 0 < pct <= 200:
+        await update.message.reply_text("수익%는 0보다 크고 200 이하의 숫자로 입력하세요.")
+        return
+    from config_manager import STRATEGY_SETTINGS, save_config
+    new_settings = dict(STRATEGY_SETTINGS)
+    new_settings[ticker] = {**new_settings.get(ticker, {}), "target_profit": pct}
+    if not save_config({"STRATEGY_SETTINGS": new_settings}):
+        await update.message.reply_text("설정 저장에 실패했습니다.")
+        return
+    old = STRATEGY[ticker]["target_profit"]
+    STRATEGY[ticker]["target_profit"] = pct
+    await update.message.reply_text(
+        f"{ticker} 익절 목표를 {old:g}% → {pct:g}%로 바꿨습니다.\n"
+        f"지정가 매도는 평단 +{pct:g}%, 별% = {pct:g} - {2 * pct / STRATEGY[ticker]['total_a']:.3g}×T 로 바로 적용됩니다 "
+        f"(다음 주문부터). T와 잔금은 그대로입니다.")
 
 
 async def cmd_del_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -673,7 +707,7 @@ async def post_init(application):
         BotCommand("help", "도움말"), BotCommand("status", "현황"), BotCommand("report", "HTML 리포트"),
         BotCommand("cash", "예수금"), BotCommand("profit_history", "수익기록"), BotCommand("logs", "최근 24시간 로그"),
         BotCommand("sync", "동기화와 체결 정산"), BotCommand("manual_order", "수동 주문"), BotCommand("set_t", "진행도 T 보정"),
-        BotCommand("add_target", "종목 추가"), BotCommand("edit_target", "종목 수정"), BotCommand("del_target", "종목 삭제"),
+        BotCommand("set_profit", "익절 목표 변경"), BotCommand("add_target", "종목 추가"), BotCommand("edit_target", "종목 수정"), BotCommand("del_target", "종목 삭제"),
         BotCommand("liquidate", "전량 매도 후 종료"),
     ])
     notifier.set_bot(application.bot)

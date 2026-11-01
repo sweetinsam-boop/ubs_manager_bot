@@ -246,9 +246,7 @@ def step_strategy(cash: float) -> dict:
         say(f"\n[{tk}]")
         seed = ask_number(f"  {tk}에 배정할 원금 (달러)", 4000.0 if tk == "TQQQ" else 2000.0, minimum=100.0)
         n = int(ask_number("  분할 수 (20 또는 40 권장)", 20, minimum=5))
-        pct = DEFAULT_PCT.get(tk)
-        if pct is None:
-            pct = ask_number("  3/4 지정가 익절 목표 %", 10.0, minimum=0.1)
+        pct = ask_number("  3/4 지정가 익절 목표 % (공식 기본값 그대로면 Enter)", DEFAULT_PCT.get(tk, 10.0), minimum=0.1)
         say(f"  → 1회 매수금 ${seed / n:,.0f}, 지정가 익절 +{pct:g}%")
         settings[tk] = {"seed": seed, "total_a": n, "target_profit": pct}
         total += seed

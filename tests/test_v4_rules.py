@@ -17,11 +17,18 @@ def _by_kind(plan, kind):
 
 class StarFormula(unittest.TestCase):
     def test_official_coefficients(self):
-        self.assertAlmostEqual(r.star_pct("TQQQ", 10, 20), 0.0)       # 15-1.5T
-        self.assertAlmostEqual(r.star_pct("TQQQ", 10, 40), 7.5)       # 15-0.75T
-        self.assertAlmostEqual(r.star_pct("SOXL", 8.6, 20), 2.8)      # 20-2T (카페 예시)
+        self.assertAlmostEqual(r.star_pct("TQQQ", 10, 20), 0.0)       # 15-1.5T (설정 없으면 공식 기본값)
+        self.assertAlmostEqual(r.star_pct("TQQQ", 10, 40, 15), 7.5)   # 15-0.75T
+        self.assertAlmostEqual(r.star_pct("SOXL", 8.6, 20, 20), 2.8)  # 20-2T (카페 예시)
         self.assertAlmostEqual(r.star_pct("SOXL", 10, 40), 10.0)      # 20-T
         self.assertAlmostEqual(r.star_pct("TQQQ", 20, 20), -15.0)     # 마지막 T는 쿼터손절 -15%
+
+    def test_user_can_override_profit_pct(self):
+        self.assertEqual(r.limit_pct("TQQQ", 12), 12.0)
+        self.assertAlmostEqual(r.star_pct("TQQQ", 10, 20, 12), 12 - 1.2 * 10)  # 기준% 12 → 12-1.2T
+        p = r.plan_normal("TQQQ", 12, 20, 5, 4000, 50.0, 40)
+        self.assertEqual(p["target"], 56.0)  # 평단 +12%
+        self.assertAlmostEqual(r.reverse_exit_price("TQQQ", 100, 12), 88.0)
 
     def test_star_point_example(self):
         # SOXL 20분할, 평단 38.30, T=8.6 → 별지점 39.37
