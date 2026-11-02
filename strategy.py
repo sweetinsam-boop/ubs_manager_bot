@@ -147,7 +147,8 @@ def execute_all_order(ticker: str, info: dict) -> tuple[str, int]:
             grid_ok, grid_fail = grid_ok + good, grid_fail + (not good)
             continue
         status = "성공" if good else f"실패({(res or {}).get('msg1', '')})"
-        lines.append(f"  {KIND_LABEL[o['kind']]} {o['qty']}주 @ ${o['price']:.2f}: {status}")
+        px = "시장가" if o["type"] == "MOC" else f"@ ${o['price']:.2f}"
+        lines.append(f"  {KIND_LABEL[o['kind']]} {o['qty']}주 {px}: {status}")
     if grid_ok or grid_fail:
         lines.append(f"  줍줍 {grid_ok + grid_fail}건: 성공 {grid_ok}, 실패 {grid_fail}")
     if info["mode"] == "reverse" and info.get("day1") and (ok > 0 or not info.get("orders")):
