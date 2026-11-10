@@ -20,8 +20,8 @@ def _atomic_write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def load_json(path: Path, default: Any = None) -> Any:
-    """JSON 파일 로드. 파일이 없으면 default 반환."""
+def load_json(path: Path, default: Any = None, strict: bool = False) -> Any:
+    """JSON 파일 로드. 파일이 없으면 default 반환. strict면 깨진 파일을 빈 값으로 읽지 않고 예외를 낸다."""
     if not path.exists():
         return default if default is not None else {}
     try:
@@ -29,17 +29,21 @@ def load_json(path: Path, default: Any = None) -> Any:
             return json.load(f)
     except Exception as e:
         log.error(f"JSON 로드 실패 ({path.name}): {e}")
+        if strict:
+            raise
         return default if default is not None else {}
 
 
-def save_json(path: Path, data: Any, **kwargs):
-    """JSON 파일 저장. 부모 디렉토리 자동 생성."""
+def save_json(path: Path, data: Any, strict: bool = False, **kwargs):
+    """JSON 파일 저장. 부모 디렉토리 자동 생성. strict면 저장 실패를 삼키지 않고 예외를 낸다."""
     kwargs.setdefault("ensure_ascii", False)
     kwargs.setdefault("indent", 4)
     try:
         _atomic_write(path, json.dumps(data, **kwargs))
     except Exception as e:
         log.error(f"JSON 저장 실패 ({path.name}): {e}")
+        if strict:
+            raise
 
 
 def load_text(path: Path) -> str:

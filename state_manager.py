@@ -19,6 +19,7 @@ def make_entry(ticker: str, sv: dict, data: dict | None = None) -> dict:
         "seed": float(sv.get("seed", 0.0)),
         "total_a": float(sv.get("total_a", 20.0)),
         "target_profit": float(sv.get("target_profit") or default_pct(ticker)),
+        "liquidating": bool(sv.get("liquidating")),  # /liquidate 진행 중 (재시작해도 새 사이클을 열지 않게 설정에 저장)
         "data": data if data is not None else {"avg": 0.0, "qty": 0.0, "cumul": 0.0},
     }
 

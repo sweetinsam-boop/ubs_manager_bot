@@ -70,12 +70,19 @@ def _kb(*rows) -> InlineKeyboardMarkup:
 
 
 async def _active_unfilled(ticker: str) -> int:
+    """미체결 대기 건수. 조회에 실패하면 -1 (0으로 돌려주면 중복 주문 방지가 그냥 통과한다)."""
     try:
         unfilled = await asyncio.to_thread(kis_client.query_unfilled_orders_today_us, ticker)
         return sum(1 for u in unfilled if u.get("status") == "대기") if unfilled else 0
     except Exception as e:
         log.warning("미체결 확인 중 오류: %s", e)
-        return 0
+        return -1
+
+
+def _unfilled_block_msg(ticker: str, active: int) -> str:
+    if active < 0:
+        return f"{ticker}: 미체결 조회에 실패해 중복 여부를 확인하지 못했습니다. 전송하지 않았으니 잠시 후 다시 시도하세요."
+    return f"{ticker}: 이미 접수된 미체결 주문이 있어 중복 방지를 위해 전송하지 않았습니다."
 
 
 # ── 시작·도움말·조회 ─────────────────────────────────────────────
@@ -268,10 +275,14 @@ async def cmd_set_t(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if t_value is not None and not 0 <= t_value <= STRATEGY[ticker]["total_a"] + 5:
         await update.message.reply_text("T값 범위가 올바르지 않습니다.")
         return
-    await asyncio.to_thread(state_manager.sync_account)
+    ok, res = await asyncio.to_thread(state_manager.sync_account)
+    if not ok:  # 잔고를 모르면 잔금 추정이 틀린다
+        await update.message.reply_text(f"[동기화 실패] {res}\n보정하지 않았습니다. 잠시 후 다시 시도하세요.")
+        return
     t, pool = await asyncio.to_thread(strategy.recalibrate, ticker, t_value)
     await update.message.reply_text(
-        f"{ticker} 진행도를 보정했습니다.\nT {t:.2f} / {STRATEGY[ticker]['total_a']:g}, 잔금 ${pool:,.2f} (원금 - 보유 원가)")
+        f"{ticker} 진행도를 보정했습니다.\nT {t:.2f} / {STRATEGY[ticker]['total_a']:g}, "
+        f"잔금 ${pool:,.2f} (원금 - 보유 원가 + 이번 사이클 실현손익)")
 
 
 # ── 수동 주문 ────────────────────────────────────────────────────
@@ -291,7 +302,8 @@ async def cmd_manual_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for ticker in STRATEGY:
         locked = utils.check_trade_lock(ticker)
         active = await _active_unfilled(ticker)
-        lines.append(f"{_e(ticker)}: {'오늘 주문 전송됨' if locked else '오늘 주문 전'}, 미체결 대기 {active}건")
+        lines.append(f"{_e(ticker)}: {'오늘 주문 전송됨' if locked else '오늘 주문 전'}, "
+                     + (f"미체결 대기 {active}건" if active >= 0 else "미체결 조회 실패"))
         rows.append([(f"{ticker} 미체결 상세", f"unfilled:{ticker}"), (f"{ticker} 오늘 주문", f"m_plan:{ticker}")])
     lines.append("\n이미 주문이 있는 종목에 다시 주문하면 중복 매수가 됩니다. 먼저 /status 와 미체결 상세를 확인하세요.")
     await wait.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=_kb(*rows))
@@ -313,8 +325,9 @@ async def _cb_m_plan(update, context, query, parts):
 
 async def _cb_m_go(update, context, query, parts):
     ticker = parts[1]
-    if await _active_unfilled(ticker):
-        await query.edit_message_text(f"{ticker}: 이미 접수된 미체결 주문이 있어 중복 방지를 위해 전송하지 않았습니다.")
+    active = await _active_unfilled(ticker)
+    if active:
+        await query.edit_message_text(_unfilled_block_msg(ticker, active))
         return
     await query.edit_message_text(f"{ticker} 주문을 전송하는 중입니다.")
     res = await asyncio.to_thread(TradeService.execute_daily_order, ticker)
@@ -323,8 +336,9 @@ async def _cb_m_go(update, context, query, parts):
 
 async def _cb_m_force(update, context, query, parts):
     ticker = parts[1]
-    if await _active_unfilled(ticker):
-        await query.edit_message_text(f"{ticker}: 미체결 대기 주문이 있어 전송하지 않았습니다.")
+    active = await _active_unfilled(ticker)
+    if active:
+        await query.edit_message_text(_unfilled_block_msg(ticker, active))
         return
     text, ok = await asyncio.to_thread(strategy.force_first_entry, ticker)
     if ok:
@@ -511,6 +525,8 @@ async def _save_target(update, args, adding: bool):
         await update.message.reply_text(_target_usage(cmd) + ("\n등록 종목: " + ", ".join(STRATEGY) if not adding else ""))
         return
     ticker, seed, n, target, err = _parse_target_args(args, prev)
+    if not err and adding and ticker not in kis_client.SUPPORTED_TICKERS:
+        err = f"{ticker}는 거래소 정보가 등록되지 않아 주문할 수 없습니다. 지원 종목: {', '.join(kis_client.SUPPORTED_TICKERS)}"
     if err:
         await update.message.reply_text(err)
         return
@@ -652,11 +668,22 @@ async def _cb_exec_liq(update, context, query, parts):
         price = await asyncio.to_thread(kis_client.get_current_price, ticker)
     name = "시장가(MOC)" if ord_type == "02" else "지정가"
     await query.edit_message_text(f"{ticker} {qty}주 전량 {name} 매도 주문 중입니다.")
+    # 오늘 자동 주문이 보유 전량에 매도를 걸어 두므로, 먼저 취소하지 않으면 수량 부족으로 거절된다.
+    try:
+        for u in await asyncio.to_thread(kis_client.query_unfilled_orders_today_us, ticker):
+            await asyncio.to_thread(kis_client.cancel_order, ticker, u["ord_no"], u["qty"])
+        await asyncio.sleep(1)  # 취소 반영 대기
+    except Exception as e:
+        await query.edit_message_text(f"기존 미체결 주문을 취소하지 못해 매도하지 않았습니다: {e}")
+        return
     res = await asyncio.to_thread(kis_client.send_order, ticker, qty, price, "SELL", "MOC" if ord_type == "02" else "00")
     if res.get("rt_cd") != "0":
-        await query.edit_message_text(f"매도 실패: {res.get('msg1')}")
+        await query.edit_message_text(f"매도 실패: {res.get('msg1')}\n오늘 걸려 있던 자동 주문은 취소된 상태입니다.")
         return
-    STRATEGY[ticker]["liquidating"] = True  # 체결 확인과 수익 기록이 끝난 뒤 장 마감 후 동기화에서 삭제
+    # 체결 확인과 수익 기록이 끝난 뒤 장 마감 후 동기화에서 삭제. 재시작해도 남도록 설정에도 저장한다.
+    STRATEGY[ticker]["liquidating"] = True
+    from config_manager import STRATEGY_SETTINGS, save_config
+    save_config({"STRATEGY_SETTINGS": {**STRATEGY_SETTINGS, ticker: {**STRATEGY_SETTINGS.get(ticker, {}), "liquidating": True}}})
     utils.set_trade_lock(ticker)
     await query.edit_message_text(
         f"{ticker} 전량 매도 주문을 접수했습니다.\n장 마감 후 체결 확인과 수익 기록이 끝나면 설정이 자동으로 삭제됩니다.")
@@ -716,7 +743,7 @@ async def post_init(application):
     if not chat_id:
         log.info("등록된 채팅이 없습니다. 텔레그램에서 /start 를 보내 주세요.")
         return
-    from scheduler import check_missed_settlement, register_schedules
+    from scheduler import check_missed_orders, check_missed_settlement, register_schedules
     register_schedules(application.job_queue, chat_id)
     log.info("Registered schedules for chat_id=%s", chat_id)
 
@@ -728,5 +755,9 @@ async def post_init(application):
         if exc is not None:
             log.error("check_missed_settlement failed: %s", exc, exc_info=True)
 
-    task = asyncio.create_task(check_missed_settlement(application))
+    async def _startup_checks():
+        await check_missed_orders(chat_id)
+        await check_missed_settlement(application)
+
+    task = asyncio.create_task(_startup_checks())
     task.add_done_callback(_log_done)

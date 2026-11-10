@@ -41,11 +41,12 @@ def _default_record() -> dict[str, Any]:
 
 
 def load_v4_state() -> dict[str, Any]:
-    return load_json(get_path(_V4_STATE_JSON), default={})
+    # 깨진 파일을 빈 값으로 읽으면 다음 저장이 다른 종목의 T까지 지운다. 실패는 예외로 알린다.
+    return load_json(get_path(_V4_STATE_JSON), default={}, strict=True)
 
 
 def save_v4_state(data: dict[str, Any]) -> None:
-    save_json(get_path(_V4_STATE_JSON), data, ensure_ascii=False, indent=2)
+    save_json(get_path(_V4_STATE_JSON), data, strict=True, ensure_ascii=False, indent=2)
 
 
 def _merge(raw: Any) -> dict[str, Any]:

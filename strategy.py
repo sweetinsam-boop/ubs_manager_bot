@@ -29,6 +29,27 @@ def profit_target_pct(ticker: str) -> float:
     return rules.limit_pct(ticker, STRATEGY[ticker]["target_profit"])
 
 
+def _estimated_pool(ticker: str) -> float:
+    """잔금 추정: 원금 - 보유 원가 + 이번 사이클 실현손익. 손절 매도로 잃은 돈은 잔금에 없다."""
+    s = STRATEGY[ticker]
+    d = s["data"]
+    cost = float(d.get("avg") or 0.0) * float(d.get("qty") or 0.0)
+    start = ((utils.load_cycle_state().get(ticker) or {}).get("active") or {}).get("start_date") or ""
+    kst, ny = pytz.timezone("Asia/Seoul"), pytz.timezone("America/New_York")
+    realized = 0.0
+    for h in utils.load_cumul_profit()["history"]:
+        if h.get("ticker") != ticker:
+            continue
+        try:  # 기록 시각은 한국 시간, 사이클 시작일은 미국 날짜다
+            day = kst.localize(datetime.datetime.strptime(str(h.get("date")), "%Y-%m-%d %H:%M")).astimezone(ny).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+        # shortcut: 체결 시각이 아니라 기록 시각 기준, 정산이 다음 사이클 시작 뒤로 밀리면 하루 어긋난다
+        if day >= start:
+            realized += float(h.get("profit") or 0.0)
+    return max(float(s["seed"]) - cost + realized, 0.0)
+
+
 def current_state(ticker: str) -> tuple[float, float]:
     """(T, 잔금) 읽기 전용. 상태가 없으면 보유 원가로 추정한다 (중간 합류·상태 유실 대비)."""
     s = STRATEGY[ticker]
@@ -39,7 +60,7 @@ def current_state(ticker: str) -> tuple[float, float]:
     if t is None:
         t = rules.implied_t(cost, s["seed"], s["total_a"])
     if pool is None:
-        pool = max(float(s["seed"]) - cost, 0.0)
+        pool = _estimated_pool(ticker)
     return float(t), float(pool)
 
 
@@ -69,7 +90,10 @@ def build_order_info(ticker: str) -> dict:
     t, pool = current_state(ticker)
     cash = float(state_manager.CURRENT_CASH or 0.0)
     if cash > 0:
-        pool = min(pool, cash)  # 계좌 현금보다 많이 주문하지 않는다
+        # 계좌 현금보다 많이 주문하지 않는다. 예수금은 종목이 함께 쓰므로 잔금 비율로 나눈다.
+        total = sum(current_state(tk)[1] for tk in STRATEGY)
+        if total > cash:
+            pool = pool * cash / total
 
     price = _price(kis_client.get_current_price, ticker) or _price(kis_client.get_prev_close, ticker)
     info = {
@@ -95,8 +119,9 @@ def build_order_info(ticker: str) -> dict:
 
     if reverse:
         day1 = info["reverse_enter"] or not rec["reverse_day1_done"]
-        star_ref = _price(lambda tk: kis_client.get_avg_close_last_n_days(tk, 5), ticker) or prev_close or avg
-        info.update(rules.plan_reverse(ticker, n, qty, pool, star_ref, day1))
+        avg5 = _price(lambda tk: kis_client.get_avg_close_last_n_days(tk, 5), ticker)
+        info.update(rules.plan_reverse(ticker, n, qty, pool, avg5 or prev_close or avg, day1))
+        info["star_fallback"] = not day1 and avg5 <= 0  # 5일 평균을 못 구해 전일 종가로 대신했다
     else:
         info.update(rules.plan_normal(ticker, tp, n, t, pool, avg, qty))
     return info
@@ -110,12 +135,10 @@ def _odno(res) -> str:
 def execute_all_order(ticker: str, info: dict) -> tuple[str, int]:
     """info의 주문을 전송하고 상태를 확정한다. (결과 텍스트, 접수 성공 건수)."""
     ymd = utils.get_us_today()
+    first = info["mode"] == "first"
     with v4_state.locked():
         upd: dict = {}
-        if info["mode"] == "first":
-            upd.update(t=0.0, pool=info["seed"], reverse=False, reverse_started_ymd=None,
-                       reverse_day1_done=False, orders=[])
-        else:
+        if not first:  # 첫 매수의 상태 초기화는 주문이 접수된 뒤에 한다 (아래)
             rec = v4_state.get_record(ticker)
             t0, p0 = current_state(ticker)
             if rec["t"] is None:
@@ -134,15 +157,18 @@ def execute_all_order(ticker: str, info: dict) -> tuple[str, int]:
     lines = [f"[{ticker} 주문 결과 - V4.0 {label}]"]
     ok = 0
     grid_ok = grid_fail = 0
+    sent: list[dict] = []
     for o in info.get("orders", []):
         res = kis_client.send_order(ticker, o["qty"], o["price"], o["side"], o["type"])
         good = bool(res) and str(res.get("rt_cd")) == "0"
         if good:
             ok += 1
-            v4_state.add_order(ticker, {
+            sent.append({
                 **o, "ymd": ymd, "odno": _odno(res), "settled": False,
                 "half": half if o["kind"] in _HALF_KINDS else None,
             })
+            if not first:
+                v4_state.add_order(ticker, sent[-1])
         if o["kind"] in ("grid", "rev_grid"):
             grid_ok, grid_fail = grid_ok + good, grid_fail + (not good)
             continue
@@ -151,6 +177,11 @@ def execute_all_order(ticker: str, info: dict) -> tuple[str, int]:
         lines.append(f"  {KIND_LABEL[o['kind']]} {o['qty']}주 {px}: {status}")
     if grid_ok or grid_fail:
         lines.append(f"  줍줍 {grid_ok + grid_fail}건: 성공 {grid_ok}, 실패 {grid_fail}")
+    if first and sent:  # 접수에 실패했다면 지난 사이클의 T·잔금·정산 대기 주문을 지우지 않는다
+        v4_state.put_record(ticker, t=0.0, pool=info["seed"], reverse=False, reverse_started_ymd=None,
+                            reverse_day1_done=False, orders=sent)
+    if info.get("star_fallback"):
+        lines.append("  주의: 5일 종가 평균을 가져오지 못해 전일 종가를 별지점으로 썼습니다.")
     if info["mode"] == "reverse" and info.get("day1") and (ok > 0 or not info.get("orders")):
         v4_state.put_record(ticker, reverse_day1_done=True)
     if not info.get("orders"):
@@ -208,12 +239,12 @@ def force_first_entry(ticker: str) -> tuple[str, int]:
 
 
 def recalibrate(ticker: str, t_value: float | None = None) -> tuple[float, float]:
-    """T를 직접 지정하거나(예: 카페 엑셀 값), 생략하면 보유 원가로 다시 추정한다. 잔금은 원금-보유원가."""
+    """T를 직접 지정하거나(예: 카페 엑셀 값), 생략하면 보유 원가로 다시 추정한다. 잔금은 원금-보유원가+실현손익."""
     s = STRATEGY[ticker]
     d = s["data"]
     cost = float(d.get("avg") or 0.0) * float(d.get("qty") or 0.0)
     t = float(t_value) if t_value is not None else rules.implied_t(cost, s["seed"], s["total_a"])
-    pool = max(float(s["seed"]) - cost, 0.0)
+    pool = _estimated_pool(ticker)
     v4_state.put_record(ticker, t=t, pool=pool)
     return t, pool
 
@@ -242,6 +273,6 @@ def add_cumul_profit(ticker, profit_amount, sell_qty, sell_price, avg_price, ord
     if on:
         processed.append(on)
         data["processed_orders"] = processed[-200:]
-    data["history"] = data["history"][-100:]
+    data["history"] = data["history"][-500:]  # 잔금 추정이 이번 사이클의 매도 기록을 합산하므로 넉넉히 둔다
     utils.save_cumul_profit(data)
     return float(data[ticker]), True

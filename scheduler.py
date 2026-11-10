@@ -14,10 +14,13 @@ import utils
 from bot_logging import get_logger
 from notification_service import notifier
 from state_manager import STRATEGY
-from trade_service import TradeService
+from trade_service import RetryLater, TradeService
 from ui_formatter import UIFormatter, pre
 
 log = get_logger(__name__)
+
+RETRY_EVERY = 300  # 조회 실패로 못 보낸 주문을 다시 시도하는 간격(초)
+RETRY_MAX = 6      # 재시도 횟수 (5분 x 6 = 30분)
 
 _daily_trade_running = False  # 같은 스케줄이 겹쳐 중복 주문되는 것을 막는 플래그
 
@@ -50,29 +53,68 @@ async def daily_market_check(context: ContextTypes.DEFAULT_TYPE):
         _daily_trade_running = False
 
 
-async def _run_daily_market(chat_id):
+async def _order_round(chat_id, tickers: list[str]) -> tuple[list[str], str]:
+    """동기화·정산 후 tickers의 오늘 주문을 보낸다. (조회 실패로 못 보낸 종목, 그 이유)를 돌려준다."""
+    # 잔고를 모르는 채로 주문하면 보유 중에 첫 매수가 나갈 수 있다. 동기화가 안 되면 보내지 않는다.
+    for attempt in range(3):
+        ok, msg = await asyncio.to_thread(state_manager.sync_account)
+        if ok:
+            break
+        log.warning("daily sync failed (attempt %d/3): %s", attempt + 1, msg)
+        await asyncio.sleep(20)
+    else:
+        return tickers, f"계좌 동기화 실패: {msg}"
+    log.info("모든 종목 및 자산 상태 동기화 완료")
     try:
-        await asyncio.to_thread(TradeService.sync_all_states)
         # 마감 후 정산이 빠졌다면 주문 계산 전에 T와 잔금을 먼저 맞춘다
         settled = await asyncio.to_thread(TradeService.settle_fills)
         if settled:
             await _html(chat_id, "<b>지난 체결 정산</b>\n" + pre("\n".join(settled)))
     except Exception as e:
-        log.warning(f"초기 동기화/정산 중 일부 오류 발생 (무시하고 진행): {e}")
+        log.warning(f"지난 체결 정산 중 오류 (주문은 진행): {e}")
 
+    pending, reason = [], ""
+    for ticker in tickers:
+        try:
+            res = await asyncio.to_thread(TradeService.process_ticker_daily, ticker)
+        except RetryLater as e:
+            log.warning("%s 주문 보류: %s", ticker, e)
+            pending.append(ticker)
+            reason = str(e)
+            continue
+        await _html(chat_id, UIFormatter.order_result(res))
+    return pending, reason
+
+
+async def _run_daily_market(chat_id):
     now_kst = datetime.datetime.now(pytz.timezone('Asia/Seoul'))
     now_ny = datetime.datetime.now(pytz.timezone('America/New_York'))
     await _html(chat_id, f"<b>미국 정규장 오픈</b> ({now_kst.strftime('%m-%d %H:%M')} KST / {now_ny.strftime('%H:%M')} NY)\n"
                          "오늘의 주문 전송을 시작합니다.")
 
-    for ticker in list(STRATEGY):
-        res = await asyncio.to_thread(TradeService.process_ticker_daily, ticker)
-        await _html(chat_id, UIFormatter.order_result(res))
+    # 조회 실패로 못 보낸 종목만 다시 시도한다. LOC·MOC는 장 마감 전에만 접수되면 결과가 같다.
+    pending, reason = await _order_round(chat_id, list(STRATEGY))
+    for attempt in range(RETRY_MAX):
+        if not pending:
+            break
+        if attempt == 0:
+            await _html(chat_id, f"<b>주문 보류</b> {', '.join(pending)}\n{pre(reason)}"
+                                 f"{RETRY_EVERY // 60}분 간격으로 최대 {RETRY_MAX}번 다시 시도합니다.")
+        await asyncio.sleep(RETRY_EVERY)
+        pending, reason = await _order_round(chat_id, pending)
+    if pending:
+        await _html(chat_id, f"<b>자동 주문 실패</b> {', '.join(pending)}\n{pre(reason)}"
+                             "다시 시도해도 조회가 되지 않아 오늘 주문을 보내지 못했습니다. "
+                             "증권사 상태를 확인한 뒤 /manual_order 로 직접 전송하세요.")
 
     await asyncio.sleep(10)  # 접수 반영 대기
     lines = ["<b>주문 등록 확인</b> (미국 동부 당일 미체결만 집계)"]
     for ticker in STRATEGY:
-        unfilled = await asyncio.to_thread(kis_client.query_unfilled_orders_today_us, ticker)
+        try:
+            unfilled = await asyncio.to_thread(kis_client.query_unfilled_orders_today_us, ticker)
+        except Exception as e:
+            lines.append(f"{ticker}: 미체결 조회 실패 ({e})")
+            continue
         lines.append(f"{ticker}: 미체결 {len(unfilled)}건 등록 확인" if unfilled
                      else f"{ticker}: 당일 미체결 없음 (전량 체결, 주문 없음 또는 조회 지연일 수 있음)")
     await _html(chat_id, "\n".join(lines))
@@ -168,6 +210,17 @@ async def periodic_performance_log_update(context: ContextTypes.DEFAULT_TYPE):
         log.info("performance_log periodic: updated=%s backfilled=%d", updated, filled)
 
 
+async def check_missed_orders(chat_id) -> None:
+    """봇이 09:35에 꺼져 있었다면 오늘 주문이 안 나갔다고 알린다 (자동으로 보내지는 않는다)."""
+    now = datetime.datetime.now(pytz.timezone("America/New_York"))
+    if not utils.is_market_open_today() or not (9, 40) <= (now.hour, now.minute) < (15, 50):
+        return
+    missed = [tk for tk, s in STRATEGY.items() if not s.get("liquidating") and not utils.check_trade_lock(tk)]
+    if missed:
+        await _html(chat_id, f"봇이 다시 시작됐습니다. 오늘 자동 주문 기록이 없는 종목: {', '.join(missed)}\n"
+                             "필요하면 /manual_order 로 확인한 뒤 전송하세요.")
+
+
 async def check_missed_settlement(application):
     """봇 시작 시 오늘 아침 정산 리포트가 누락됐는지 확인하고 필요하면 만든다."""
     chat_id = utils.load_chat_id()
@@ -227,6 +280,9 @@ async def post_close_sync_job(context: ContextTypes.DEFAULT_TYPE):
                 utils.delete_ticker_from_all_states(tk)
                 notes.append(f"{tk} 청산 완료. 포트폴리오에서 삭제했습니다.")
             config_manager.save_config({"STRATEGY_SETTINGS": new_settings})
+        for tk, s in STRATEGY.items():
+            if s.get("liquidating"):
+                notes.append(f"{tk} 청산 주문이 아직 체결되지 않았습니다. 자동 매매는 멈춰 있으니 /liquidate 를 다시 실행하세요.")
     except Exception as e:
         log.warning("liquidating cleanup failed: %s", e, exc_info=True)
 

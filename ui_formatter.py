@@ -107,6 +107,8 @@ class UIFormatter:
                 out.append(f"리버스 첫날: 보유 수량의 1/{info['divisor']}을 MOC로 매도합니다. 매수는 없습니다.")
             else:
                 out.append(f"리버스 별지점(5일 종가 평균) ${info['star_ref']:.2f}, 쿼터매수 금액 ${info['quarter_amt']:,.2f}")
+                if info.get("star_fallback"):
+                    out.append("주의: 5일 종가 평균을 가져오지 못해 전일 종가를 별지점으로 썼습니다.")
         else:
             out.append(f"1회분 ${info['one_time']:,.2f} = 원금 ÷ N")
 

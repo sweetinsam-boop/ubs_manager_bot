@@ -221,6 +221,7 @@ def kis_api_call(method, url, headers, params=None, data=None):
                     continue
 
             res = _safe_json(raw)
+            res.setdefault("tr_cont", raw.headers.get("tr_cont", ""))  # 연속조회 여부는 본문이 아니라 응답 헤더에 온다
 
             # 토큰 만료/무효 응답 감지
             need_refresh = (
@@ -362,6 +363,10 @@ def get_exchange_code(ticker):
     # 기본 fallback
     return "NASD"
 
+# 거래소 코드가 등록된 종목. 그 외는 나스닥으로 보내져 주문이 거절될 수 있어 /add_target 에서 막는다.
+SUPPORTED_TICKERS = ("TQQQ", "SQQQ", "TSLA", "AAPL", "NVDA", "MSFT", "GOOGL", "SOXL")
+
+
 def send_order(ticker, qty, price, side="BUY", order_type="00", max_retries=2):
     actual_order_type = order_type
     if order_type == "LOC": actual_order_type = "34"
@@ -402,15 +407,23 @@ def send_order(ticker, qty, price, side="BUY", order_type="00", max_retries=2):
             if result.get('rt_cd') == '0':
                 return result
 
-            if attempt < max_retries:
-                time.sleep(1)
+            # 거절은 다시 보내도 같은 결과다. 초당 건수 초과와 토큰 만료만 재시도한다.
+            text = f"{result.get('msg_cd', '')} {result.get('msg1', '')}"
+            expired = _kis_token_expired_api_message(result)
+            if attempt < max_retries and (expired or "EGW00201" in text or "초당 거래건수" in text):
+                if expired:
+                    get_kis_access_token(force_renew=True)
+                time.sleep(1.5)
                 continue
             return result
-        except Exception as e:
+        except requests.ConnectTimeout as e:  # 연결도 못 했으니 접수됐을 리 없다
             if attempt < max_retries:
                 time.sleep(1)
                 continue
             return {"rt_cd": "-1", "msg1": f"통신오류: {str(e)}"}
+        except Exception as e:
+            # 응답만 못 받았을 수 있다. 다시 보내면 중복 주문이 되므로 재시도하지 않는다.
+            return {"rt_cd": "-1", "msg1": f"통신오류, 접수 여부 미확인 (미체결 상세를 확인하세요): {str(e)}"}
 
 def cancel_order(ticker, order_no, qty, max_retries=2):
     """
@@ -652,7 +665,9 @@ def query_ccnl_raw(ticker="", excg="NASD", start_dt=None, end_dt=None, ccld_dvsn
     }
     
     try:
-        res = _safe_json(requests.get(url, headers=headers, params=params, timeout=10))
+        raw = requests.get(url, headers=headers, params=params, timeout=10)
+        res = _safe_json(raw)
+        res.setdefault("tr_cont", raw.headers.get("tr_cont", ""))  # 연속조회 여부는 응답 헤더에 온다
         return res
     except Exception as e:
         return {"rt_cd": "-1", "msg1": str(e)}
@@ -665,8 +680,9 @@ def query_ccnl_collect_all_pages(
     end_dt: str,
     ccld_dvsn: str = "01",
     max_pages: int = 40,
-) -> list:
-    """주문체결내역 연속조회로 기간 전체 행을 모읍니다."""
+    strict: bool = False,
+) -> list | None:
+    """주문체결내역 연속조회로 기간 전체 행을 모읍니다. strict면 한 페이지라도 실패할 때 None (일부만 읽고 '체결 없음'으로 오해하지 않게)."""
     acc = []
     nk, fk, tr_cont = "", "", ""
     for _ in range(max_pages):
@@ -681,6 +697,8 @@ def query_ccnl_collect_all_pages(
             tr_cont=tr_cont,
         )
         if res.get("rt_cd") != "0":
+            if strict:
+                return None
             break
         acc.extend(res.get("output", []) or [])
         nk = res.get("ctx_area_nk200", "") or ""
@@ -727,33 +745,7 @@ def query_ccnl_for_report(excg_list=None, days_back=3, max_pages=2):
     now_ny = datetime.datetime.now(ny_tz)
     end_dt = now_ny.strftime("%Y%m%d")
     start_dt = (now_ny - datetime.timedelta(days=days_back)).strftime("%Y%m%d")
-    all_orders = []
-    nk200, fk200 = "", ""
-    tr_cont = ""
-    for _ in range(max_pages):
-        res = query_ccnl_raw(
-            ticker="",
-            excg="NASD",
-            start_dt=start_dt,
-            end_dt=end_dt,
-            ccld_dvsn="01",
-            ctx_nk200=nk200,
-            ctx_fk200=fk200,
-            tr_cont=tr_cont,
-        )
-        if res.get("rt_cd") != "0":
-            break
-        out = res.get("output", [])
-        if out:
-            all_orders.extend(out)
-        nk200 = res.get("ctx_area_nk200", "") or ""
-        fk200 = res.get("ctx_area_fk200", "") or ""
-        cont = (res.get("tr_cont") or "").strip()
-        if cont in ("M", "F"):
-            tr_cont = "N"
-        else:
-            break
-    return all_orders
+    return query_ccnl_collect_all_pages("", "NASD", start_dt, end_dt, ccld_dvsn="01", max_pages=max_pages)
 
 
 def query_recent_orders(ticker: str, days_back: int = 5, max_pages: int = 3):
@@ -769,37 +761,9 @@ def query_recent_orders(ticker: str, days_back: int = 5, max_pages: int = 3):
     end_dt = now_ny.strftime("%Y%m%d")
     start_dt = (now_ny - datetime.timedelta(days=days_back)).strftime("%Y%m%d")
 
-    excg = get_exchange_code(ticker)
-    nk200, fk200 = "", ""
-    tr_cont = ""
-    out = []
-
-    for _ in range(max_pages):
-        res = query_ccnl_raw(
-            ticker=ticker,
-            excg=excg,
-            start_dt=start_dt,
-            end_dt=end_dt,
-            ccld_dvsn="00",  # 전체(체결/미체결)
-            ctx_nk200=nk200,
-            ctx_fk200=fk200,
-            tr_cont=tr_cont,
-        )
-        if res.get("rt_cd") != "0":
-            break
-        rows = res.get("output", []) or []
-        if rows:
-            out.extend(rows)
-
-        nk200 = res.get("ctx_area_nk200", "") or ""
-        fk200 = res.get("ctx_area_fk200", "") or ""
-        cont = (res.get("tr_cont") or "").strip()
-        if cont in ("M", "F"):
-            tr_cont = "N"
-        else:
-            break
-
-    return out
+    # ccld_dvsn "00" = 전체(체결/미체결)
+    return query_ccnl_collect_all_pages(ticker, get_exchange_code(ticker), start_dt, end_dt,
+                                        ccld_dvsn="00", max_pages=max_pages)
 
 
 def fills_by_order(ticker: str, days_back: int = 10, max_pages: int = 6) -> dict[str, tuple[int, float]] | None:
@@ -812,20 +776,10 @@ def fills_by_order(ticker: str, days_back: int = 10, max_pages: int = 6) -> dict
     now_ny = datetime.datetime.now(pytz.timezone("America/New_York"))
     end_dt = now_ny.strftime("%Y%m%d")
     start_dt = (now_ny - datetime.timedelta(days=days_back)).strftime("%Y%m%d")
-    excg = get_exchange_code(ticker)
-    rows, nk, fk, tr_cont = [], "", "", ""
-    for page in range(max_pages):
-        res = query_ccnl_raw(ticker=ticker, excg=excg, start_dt=start_dt, end_dt=end_dt,
-                             ccld_dvsn="00", ctx_nk200=nk, ctx_fk200=fk, tr_cont=tr_cont)
-        if res.get("rt_cd") != "0":
-            if page == 0:
-                return None
-            break
-        rows.extend(res.get("output", []) or [])
-        nk, fk = res.get("ctx_area_nk200", "") or "", res.get("ctx_area_fk200", "") or ""
-        if (res.get("tr_cont") or "").strip() not in ("M", "F"):
-            break
-        tr_cont = "N"
+    rows = query_ccnl_collect_all_pages(ticker, get_exchange_code(ticker), start_dt, end_dt,
+                                        ccld_dvsn="00", max_pages=max_pages, strict=True)
+    if rows is None:
+        return None
 
     out: dict[str, tuple[int, float]] = {}
     for o in sorted(rows, key=lambda r: (str(r.get("ord_dt", "")), str(r.get("ord_tmd", "")))):
@@ -904,10 +858,11 @@ def _rows_to_unfilled_entries(rows):
 def query_unfilled_orders_raw(ticker: str = "", max_pages: int = 5) -> list:
     """
     해외주식 미체결내역 API(TTTS3018R)를 호출하여 연속조회로 미체결 주문 행들을 반환합니다.
+    첫 조회가 실패하면 RuntimeError (중복 주문 방지 확인이 '미체결 없음'으로 통과하지 않게).
     """
     token = get_kis_access_token()
     if not token:
-        return []
+        raise RuntimeError("미체결 조회 실패: access_token 없음")
     url = f"{URL_BASE}/uapi/overseas-stock/v1/trading/inquire-nccs"
     base_headers = {
         "Content-Type": "application/json",
@@ -921,11 +876,11 @@ def query_unfilled_orders_raw(ticker: str = "", max_pages: int = 5) -> list:
     rows = []
     nk200, fk200 = "", ""
     tr_cont = ""
-    for _ in range(max_pages):
+    for page in range(max_pages):
         headers = dict(base_headers)
         if tr_cont:
             headers["tr_cont"] = tr_cont
-        
+
         params = {
             "CANO": CANO,
             "ACNT_PRDT_CD": ACNT_PRDT_CD,
@@ -936,6 +891,8 @@ def query_unfilled_orders_raw(ticker: str = "", max_pages: int = 5) -> list:
         }
         res = kis_api_call("GET", url, headers, params=params)
         if not res or res.get("rt_cd") != "0":
+            if page == 0:
+                raise RuntimeError(f"미체결 조회 실패: {(res or {}).get('msg1') or '응답 없음'}")
             break
         
         out = res.get("output", [])

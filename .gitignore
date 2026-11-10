@@ -28,3 +28,6 @@ scratch/
 !README.md
 *.txt
 !requirements.txt
+
+# 정리하며 옮긴 예전 파일
+_archive/

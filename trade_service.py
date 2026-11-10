@@ -15,6 +15,10 @@ from bot_logging import get_logger
 log = get_logger(__name__)
 
 
+class RetryLater(Exception):
+    """증권사 조회가 안 돼 주문을 보내지 않았다. 아무것도 전송하지 않았으니 잠시 뒤 다시 시도해도 안전하다."""
+
+
 class TradeService:
     """
     비즈니스/통신 파사드 레이어 (V4.0 전용).
@@ -63,14 +67,12 @@ class TradeService:
                 data["total_cost"] += avg * qty
                 data["total_value"] += now_p * qty
 
-            locked = utils.check_trade_lock(ticker)
             try:
                 unfilled = kis_client.query_unfilled_orders_today_us(ticker) or []
-                if unfilled and not locked:
-                    locked = True
-                    utils.set_trade_lock(ticker)
             except Exception:
                 unfilled = []
+            # 표시만 한다. 잠금은 주문 시점(process_ticker_daily)에 건다.
+            locked = utils.check_trade_lock(ticker) or bool(unfilled)
 
             c_state = cycles.get(ticker, {})
             active = c_state.get("active")
@@ -188,23 +190,23 @@ class TradeService:
             return error_msg
 
     @staticmethod
-    def _verify_broker_qty(ticker: str):
-        """증권사 실잔고에서 실제 보유수량을 직접 조회. 조회 실패 시 None."""
+    def _broker_holding(ticker: str):
+        """증권사 실잔고에서 (보유수량, 평단)을 직접 조회. 조회 실패 시 None."""
         try:
             res = kis_client.query_account_raw()
             if not res or res.get('rt_cd') != '0':
                 return None
             for item in res.get('output1', []):
                 if item.get('ovrs_pdno', '').strip() == ticker:
-                    return int(float(item.get('ovrs_cblc_qty', '0')))
-            return 0  # 종목이 output1에 없음 = 보유 0주
+                    return int(float(item.get('ovrs_cblc_qty', '0'))), float(item.get('pchs_avg_pric', '0') or 0)
+            return 0, 0.0  # 종목이 output1에 없음 = 보유 0주
         except Exception as e:
-            log.warning("_verify_broker_qty(%s) failed: %s", ticker, e)
+            log.warning("_broker_holding(%s) failed: %s", ticker, e)
             return None
 
     @staticmethod
     def process_ticker_daily(ticker: str) -> str:
-        """전량 익절 체크 → 일반 주문 집행 순으로 처리하고 결과 메시지를 반환."""
+        """전량 익절 체크 → 일반 주문 집행 순으로 처리하고 결과 메시지를 반환. 조회 실패로 못 보냈으면 RetryLater."""
         try:
             if utils.check_trade_lock(ticker):
                 return f"[안전장치] {ticker}: 오늘 이미 매매 기록 있음. 건너뜀."
@@ -218,18 +220,27 @@ class TradeService:
             qty_t = int(d.get("qty", 0))
             results_list = []
 
-            # 메모리상 수량이 있으면 증권사 실잔고로 한 번 더 확인 (동기화 누락으로 없는 수량을 파는 사고 방지)
-            if qty_t > 0:
-                actual_qty = TradeService._verify_broker_qty(ticker)
-                if actual_qty is not None and actual_qty != qty_t:
-                    log.warning("%s pre-order verify: memory qty=%d → broker qty=%d", ticker, qty_t, actual_qty)
-                    d["qty"] = float(actual_qty)
-                    d["cumul"] = float(d.get("avg", 0.0)) * actual_qty if actual_qty > 0 else 0.0
-                    if actual_qty <= 0:
-                        d["avg"] = 0.0
-                    results_list.append(f"[{ticker}] 잔고 불일치 보정: 메모리 {qty_t}주 → 실잔고 {actual_qty}주")
-                    qty_t = actual_qty
-                    avg_p = float(d.get("avg", 0))
+            # 잠금 파일이 없어도 증권사에 오늘 미체결 주문이 있으면 중복을 피한다
+            try:
+                unfilled = kis_client.query_unfilled_orders_today_us(ticker)
+            except Exception as e:
+                raise RetryLater(f"미체결 주문을 조회하지 못했습니다 ({e})")
+            if unfilled:
+                utils.set_trade_lock(ticker)
+                return f"[안전장치] {ticker}: 증권사에 오늘 미체결 주문이 이미 있습니다. 건너뜀."
+
+            # 주문 전에 증권사 실잔고를 항상 다시 확인한다. 메모리가 0주여도 확인해야
+            # 동기화 누락으로 보유 중에 '첫 매수'를 내는 사고를 막는다.
+            held = TradeService._broker_holding(ticker)
+            if held is None:
+                raise RetryLater("증권사 잔고를 확인하지 못했습니다")
+            actual_qty, actual_avg = held
+            if actual_qty != qty_t:
+                log.warning("%s pre-order verify: memory qty=%d → broker qty=%d", ticker, qty_t, actual_qty)
+                avg_p = actual_avg if actual_qty > 0 else 0.0
+                d.update(qty=float(actual_qty), avg=avg_p, cumul=avg_p * actual_qty)
+                results_list.append(f"[{ticker}] 잔고 불일치 보정: 메모리 {qty_t}주 → 실잔고 {actual_qty}주")
+                qty_t = actual_qty
 
             # 현재가가 이미 3/4 지정가 목표 이상이면 전량 MOC 익절 (공식 규칙은 지정가 3/4 + 쿼터 LOC이므로 아래 일반 주문으로도 정리됨)
             profit_take_sent = target_reached = False
@@ -256,6 +267,8 @@ class TradeService:
                 utils.set_trade_lock(ticker)
             return "\n".join(results_list)
 
+        except RetryLater:
+            raise
         except Exception as e:
             msg = f"{ticker} 처리 중 오류: {e}"
             log.error(msg)
@@ -307,6 +320,10 @@ class TradeService:
         post_qty = float((state_manager.STRATEGY.get(ticker, {}).get("data") or {}).get("qty", 0) or 0)
         has_active_cycle = utils.load_cycle_state().get(ticker, {}).get("active") is not None
         if post_qty > 0 or not has_active_cycle:
+            return
+        held = TradeService._broker_holding(ticker)
+        if held is None or held[0] > 0:  # 잔고 응답 한 번만 믿고 T를 지우지 않는다
+            log.warning("%s cycle close skipped: 재확인 결과 %s", ticker, held)
             return
 
         utils.close_active_cycle_on_zero(ticker)
@@ -377,13 +394,3 @@ class TradeService:
             if ticker not in pre_sync_avgs:
                 TradeService._reconcile_maybe_close_cycle_on_zero(ticker, messages)
         return messages
-
-    @staticmethod
-    def sync_all_states():
-        """계좌 잔고·예수금 동기화 (T와 잔금은 체결 정산에서 갱신된다)."""
-        try:
-            state_manager.sync_account()
-            log.info("모든 종목 및 자산 상태 동기화 완료")
-        except Exception as e:
-            log.error(f"상태 동기화 중 오류 발생: {e}")
-            raise
